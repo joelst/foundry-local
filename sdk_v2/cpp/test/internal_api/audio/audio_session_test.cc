@@ -911,6 +911,7 @@ TEST_F(AudioSessionInferenceTest, TranscribeFromFilePathPopulatesSegmentTimestam
 
   EXPECT_TRUE(saw_timed_segment) << "Expected at least one FINAL segment with real timestamps";
   EXPECT_EQ(response.finish_reason, FOUNDRY_LOCAL_FINISH_STOP);
+}
 
 TEST(AudioTelemetryTest, PcmDurationCountsSamplesIncludingEmptyAndSubMillisecondInput) {
   EXPECT_EQ(AudioInternal::AudioDurationMsFromSamples(0), 0);
