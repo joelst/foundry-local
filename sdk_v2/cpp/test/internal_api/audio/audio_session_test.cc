@@ -24,6 +24,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
@@ -898,6 +899,9 @@ TEST_F(AudioSessionInferenceTest, TranscribeFromFilePathPopulatesSegmentTimestam
     ASSERT_NE(segment, nullptr);
     EXPECT_EQ(segment->text.find("<|"), std::string::npos)
         << "Segment text leaked a timestamp marker: " << segment->text;
+    EXPECT_TRUE(std::any_of(segment->text.begin(), segment->text.end(),
+                            [](unsigned char c) { return !std::isspace(c); }))
+        << "Whitespace-only segment should not be emitted";
 
     if (segment->kind == FOUNDRY_LOCAL_SPEECH_SEGMENT_FINAL) {
       ASSERT_TRUE(segment->start_time_ms.has_value()) << "FINAL segment missing start_time_ms";

@@ -77,6 +77,12 @@ std::optional<double> TryParseWhisperTimestampToken(const std::string& token) {
   return seconds;
 }
 
+// Whisper often emits a lone space token between the last timestamp and EOT; such text carries no content and
+// must not surface as a segment.
+bool HasNonWhitespace(const std::string& text) {
+  return std::any_of(text.begin(), text.end(), [](unsigned char c) { return !std::isspace(c); });
+}
+
 // Build a FINAL segment bounded by two Whisper timestamp tokens.
 std::unique_ptr<SpeechSegmentItem> MakeTimedSegment(std::string text, std::int64_t start_ms, std::int64_t end_ms) {
   auto seg = std::make_unique<SpeechSegmentItem>(FOUNDRY_LOCAL_SPEECH_SEGMENT_FINAL, std::move(text));
@@ -332,8 +338,11 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
     if (auto timestamp_seconds = TryParseWhisperTimestampToken(token)) {
       auto boundary_ms = static_cast<std::int64_t>(std::llround(*timestamp_seconds * 1000.0));
 
-      if (current_segment_start_ms.has_value() && !current_segment_text.empty()) {
-        segments.push_back(MakeTimedSegment(current_segment_text, *current_segment_start_ms, boundary_ms));
+      if (current_segment_start_ms.has_value()) {
+        if (HasNonWhitespace(current_segment_text)) {
+          segments.push_back(MakeTimedSegment(current_segment_text, *current_segment_start_ms, boundary_ms));
+        }
+
         current_segment_text.clear();
       }
 
@@ -358,7 +367,7 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
   // Trailing text with no closing timestamp: cancellation, or a model/decode path
   // that never emitted a final boundary token. Preserve it in the result rather
   // than silently dropping it; NONE is honest since the segment never closed.
-  if (!current_segment_text.empty()) {
+  if (HasNonWhitespace(current_segment_text)) {
     segments.push_back(MakeTrailingSegment(current_segment_text, current_segment_start_ms));
   }
 
