@@ -66,7 +66,8 @@ class OnnxAudioGenerator : public AudioGenerator {
                      std::unique_ptr<OgaGenerator> generator,
                      std::unique_ptr<OgaTokenizerStream> stream,
                      int prompt_token_count,
-                     std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens);
+                     std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens,
+                     std::optional<int> audio_end_timestamp_index);
 
   /// Mask next-token logits with Whisper's timestamp rules so the decoder emits <|X.XX|> segment boundaries.
   void ApplyTimestampRules();
@@ -80,6 +81,7 @@ class OnnxAudioGenerator : public AudioGenerator {
   std::unique_ptr<OgaTokenizerStream> stream_;
   int prompt_token_count_ = 0;
   std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens_;
+  std::optional<int> audio_end_timestamp_index_;  // audio end in 0.02s steps, capped at one window; nullopt if unknown
   std::vector<int32_t> generated_tokens_;  // tokens generated after the prompt, input to the timestamp rules
   std::atomic<bool> cancelled_{false};
 };

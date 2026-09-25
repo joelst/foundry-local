@@ -45,7 +45,8 @@ float LogSumExp(std::span<const float> values) {
 void ApplyWhisperTimestampRules(std::span<float> logits,
                                 std::span<const int32_t> generated,
                                 const WhisperTimestampTokens& tokens,
-                                std::optional<int> max_initial_timestamp_index) {
+                                std::optional<int> max_initial_timestamp_index,
+                                std::optional<int> audio_end_timestamp_index) {
   const size_t vocab = logits.size();
   if (tokens.eot < 0 || tokens.timestamp_begin <= tokens.eot || static_cast<size_t>(tokens.timestamp_begin) >= vocab ||
       tokens.no_timestamps <= tokens.eot || tokens.no_timestamps >= tokens.timestamp_begin) {
@@ -66,6 +67,16 @@ void ApplyWhisperTimestampRules(std::span<float> logits,
   if (last_was_timestamp) {
     if (penultimate_was_timestamp) {
       Mask(logits, ts_begin, vocab);  // a closing+opening pair was just emitted: text must follow
+
+      // Deviation from the reference: there, <|endoftext|> right after an opening timestamp means "continue from this
+      // timestamp in the next window" and transcribe() re-decodes the remaining audio. Without that seek loop any
+      // speech after the timestamp would be silently dropped, so EOT is masked while enough audio remains. Near the
+      // end of the audio EOT stays allowed; forcing text there only produces filler such as " []".
+      const int opening_index = generated[n - 1] - tokens.timestamp_begin;
+      if (n >= 2 && audio_end_timestamp_index.has_value() &&
+          opening_index + kWhisperMinRemainingAudioTimestampSteps < *audio_end_timestamp_index) {
+        logits[eot] = kMasked;
+      }
     } else {
       Mask(logits, 0, eot);  // an unpaired timestamp must be followed by another timestamp or EOT
     }

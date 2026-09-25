@@ -19,6 +19,15 @@ struct WhisperTimestampTokens {
 /// Whisper's default `max_initial_timestamp` of 1.0s expressed in 0.02s timestamp steps.
 inline constexpr int kWhisperMaxInitialTimestampIndex = 50;
 
+/// Seconds represented by one Whisper timestamp step.
+inline constexpr double kWhisperTimestampStepSeconds = 0.02;
+
+/// Last timestamp index of a single 30 s Whisper window.
+inline constexpr int kWhisperWindowTimestampSteps = 1500;
+
+/// Minimum audio (1.0 s) that must remain after an opening timestamp for EOT to be masked there.
+inline constexpr int kWhisperMinRemainingAudioTimestampSteps = 50;
+
 /// Apply OpenAI Whisper's timestamp decoding rules (ApplyTimestampRules in openai/whisper decoding.py) to one row of
 /// next-token logits, in place. Without these rules, greedy decoding picks `<|notimestamps|>` as the first token even
 /// when the prompt omits it, so no timestamp tokens are ever generated.
@@ -29,11 +38,19 @@ inline constexpr int kWhisperMaxInitialTimestampIndex = 50;
 /// most likely text token.
 ///
 /// @param logits     Next-token logits for a single sequence (length = vocab size).
+/// One deliberate deviation: the reference ends a window with EOT right after an opening timestamp pair and then
+/// re-decodes the rest of the audio from that timestamp. There is no such seek loop here, so EOT is masked after a
+/// pair while at least `kWhisperMinRemainingAudioTimestampSteps` of audio remain before `audio_end_timestamp_index`.
+///
+/// @param logits     Next-token logits for a single sequence (length = vocab size).
 /// @param generated  Tokens generated so far, excluding the prompt.
+/// @param audio_end_timestamp_index  End of the decoded audio in 0.02s steps (capped at one window), or nullopt when
+///                   unknown, in which case EOT after a pair is allowed as in the reference.
 /// Leaves `logits` untouched if the token IDs are inconsistent with the vocabulary size.
 void ApplyWhisperTimestampRules(std::span<float> logits,
                                 std::span<const int32_t> generated,
                                 const WhisperTimestampTokens& tokens,
-                                std::optional<int> max_initial_timestamp_index = kWhisperMaxInitialTimestampIndex);
+                                std::optional<int> max_initial_timestamp_index = kWhisperMaxInitialTimestampIndex,
+                                std::optional<int> audio_end_timestamp_index = std::nullopt);
 
 }  // namespace fl::AudioInternal

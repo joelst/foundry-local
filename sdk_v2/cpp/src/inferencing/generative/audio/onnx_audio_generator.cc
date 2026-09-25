@@ -2,8 +2,11 @@
 // Licensed under the MIT License.
 #include "inferencing/generative/audio/onnx_audio_generator.h"
 #include "exception.h"
+#include "inferencing/generative/audio/pcm_utils.h"
 
 #include <ort_genai.h>
+#include <algorithm>
+#include <cmath>
 #include <span>
 #include <unordered_set>
 
@@ -76,14 +79,16 @@ OnnxAudioGenerator::OnnxAudioGenerator(std::unique_ptr<OgaAudios> audios,
                                        std::unique_ptr<OgaGenerator> generator,
                                        std::unique_ptr<OgaTokenizerStream> stream,
                                        int prompt_token_count,
-                                       std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens)
+                                       std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens,
+                                       std::optional<int> audio_end_timestamp_index)
     : audios_(std::move(audios)),
       inputs_(std::move(inputs)),
       gen_params_(std::move(gen_params)),
       generator_(std::move(generator)),
       stream_(std::move(stream)),
       prompt_token_count_(prompt_token_count),
-      timestamp_tokens_(timestamp_tokens) {}
+      timestamp_tokens_(timestamp_tokens),
+      audio_end_timestamp_index_(audio_end_timestamp_index) {}
 
 // ---------------------------------------------------------------------------
 // AudioGenerator interface
@@ -148,7 +153,8 @@ void OnnxAudioGenerator::ApplyTimestampRules() {
   const auto vocab = static_cast<size_t>(shape.back());
   auto* data = static_cast<float*>(logits->Data());
   AudioInternal::ApplyWhisperTimestampRules(std::span<float>(data + (total - vocab), vocab), generated_tokens_,
-                                            *timestamp_tokens_);
+                                            *timestamp_tokens_, AudioInternal::kWhisperMaxInitialTimestampIndex,
+                                            audio_end_timestamp_index_);
   generator_->SetLogits(*logits);
 }
 
@@ -248,6 +254,14 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
   //    timestamps are produced.
   auto timestamp_tokens = ResolveWhisperTimestampTokens(model.GetPreprocessor());
 
+  // 9. Audio end in timestamp steps, capped at the single 30 s window this generator decodes. Only WAV headers are
+  //    probed; for other formats the end is unknown and the timestamp rules fall back to the reference EOT behavior.
+  std::optional<int> audio_end_timestamp_index;
+  if (auto duration = AudioInternal::TryReadWavDurationSeconds(audio_file_path)) {
+    const double steps = std::floor(*duration / AudioInternal::kWhisperTimestampStepSeconds);
+    audio_end_timestamp_index = static_cast<int>(std::min(steps, double{AudioInternal::kWhisperWindowTimestampSteps}));
+  }
+
   // `std::make_unique` cannot access the private constructor, so use `new` directly.
   return std::unique_ptr<OnnxAudioGenerator>(new OnnxAudioGenerator(std::move(audios),
                                                                     std::move(inputs),
@@ -255,7 +269,8 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
                                                                     std::move(generator),
                                                                     std::move(stream),
                                                                     prompt_token_count,
-                                                                    timestamp_tokens));
+                                                                    timestamp_tokens,
+                                                                    audio_end_timestamp_index));
 }
 
 }  // namespace fl

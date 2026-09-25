@@ -103,13 +103,51 @@ TEST(WhisperTimestampRulesTest, ControlTokensAlwaysMasked) {
 }
 
 TEST(WhisperTimestampRulesTest, TimestampPairRequiresText) {
-  // <|0.00|><|0.02|>... two timestamps in a row: the next token must be text.
+  // <|0.00|>text<|0.02|><|0.02|>: a new segment was opened, so text must follow. With plenty of audio left,
+  // <|endoftext|> is also masked: the reference would re-decode from <|0.02|> in a later window, but without that seek
+  // loop the remaining speech would be lost.
+  auto logits = Uniform();
+  const std::vector<int32_t> generated{kTsBegin, 1, kTsBegin + 1, kTsBegin + 1};
+
+  ApplyWhisperTimestampRules(logits, generated, kTokens, kWhisperMaxInitialTimestampIndex, 1000);
+
+  ExpectOpenRange(logits, 0, kEot);
+  EXPECT_TRUE(IsMasked(logits[kEot]));
+  ExpectMaskedRange(logits, kTsBegin, kVocab);
+}
+
+TEST(WhisperTimestampRulesTest, DeferredFinalSegmentCannotEndTranscript) {
+  // Mirrors the observed whisper-tiny failure on 29.3 s audio: after ...<|22.72|><|22.72|> the model strongly prefers
+  // <|endoftext|>, which silently dropped the final sentence.
+  auto logits = Uniform();
+  logits[kEot] = 20.0f;
+  logits[3] = 1.0f;
+  const std::vector<int32_t> generated{kTsBegin, 1, 2, kTsBegin + 5, kTsBegin + 5};
+
+  ApplyWhisperTimestampRules(logits, generated, kTokens, kWhisperMaxInitialTimestampIndex, 1465);
+
+  EXPECT_EQ(Argmax(logits), 3);
+}
+
+TEST(WhisperTimestampRulesTest, EotAfterPairAllowedNearAudioEnd) {
+  // Opening timestamp 0.10 s with the audio ending at 1.0 s: under 1 s remains, so ending here is legitimate and
+  // masking EOT would only force filler text (observed as repeated " []" segments on whisper-base).
+  auto logits = Uniform();
+  const std::vector<int32_t> generated{kTsBegin, 1, kTsBegin + 5, kTsBegin + 5};
+
+  ApplyWhisperTimestampRules(logits, generated, kTokens, kWhisperMaxInitialTimestampIndex,
+                             5 + kWhisperMinRemainingAudioTimestampSteps);
+
+  EXPECT_FALSE(IsMasked(logits[kEot]));
+}
+
+TEST(WhisperTimestampRulesTest, EotAfterPairAllowedWhenAudioEndUnknown) {
   auto logits = Uniform();
   const std::vector<int32_t> generated{kTsBegin, 1, kTsBegin + 1, kTsBegin + 1};
 
   ApplyWhisperTimestampRules(logits, generated, kTokens);
 
-  ExpectOpenRange(logits, 0, kEot + 1);
+  EXPECT_FALSE(IsMasked(logits[kEot]));
   ExpectMaskedRange(logits, kTsBegin, kVocab);
 }
 
