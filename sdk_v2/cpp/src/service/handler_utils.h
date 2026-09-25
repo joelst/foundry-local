@@ -13,6 +13,10 @@
 #include <oatpp/web/protocol/http/outgoing/Response.hpp>
 #include <oatpp/web/server/HttpRequestHandler.hpp>
 
+#include "model.h"
+#include "service/web_service.h"
+#include "telemetry/telemetry_action_tracker.h"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -23,9 +27,12 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace fl {
+
+class GenAIModelInstance;
 
 using oatpp::web::protocol::http::Status;
 using oatpp::web::server::HttpRequestHandler;
@@ -56,6 +63,97 @@ inline std::shared_ptr<HttpRequestHandler::OutgoingResponse> ErrorResponse(const
 
   nlohmann::json body = {{"error", error_obj}};
   return JsonResponse(status, body);
+}
+
+inline ActionStatus ResponseToActionStatus(const std::shared_ptr<HttpRequestHandler::OutgoingResponse>& response) {
+  if (!response) {
+    return ActionStatus::kFailure;
+  }
+
+  const auto code = response->getStatus().code;
+  if (code == 408 || code == 504) {
+    return ActionStatus::kTimeout;
+  }
+
+  if (code >= 500) {
+    return ActionStatus::kFailure;
+  }
+
+  if (code >= 400) {
+    return ActionStatus::kClientError;
+  }
+
+  return ActionStatus::kSuccess;
+}
+
+inline std::string SafeHttpUserAgent(std::string_view value) {
+  constexpr std::string_view products[] = {
+      "foundry-local-core/", "foundry-local-cpp/", "foundry-local-csharp/",
+      "foundry-local-python/", "foundry-local-js/", "foundry-local-rust/"};
+  for (const auto product : products) {
+    if (!value.starts_with(product)) {
+      continue;
+    }
+
+    const auto version = value.substr(product.size());
+    const auto release = version.substr(0, std::min(version.find('-'), version.find(".dev")));
+    const auto suffix = version.substr(release.size());
+    if (release.empty() || release.size() > 32 || release.find("..") != std::string_view::npos ||
+        release.front() < '0' || release.front() > '9' ||
+        release.back() < '0' || release.back() > '9' ||
+        !std::all_of(release.begin(), release.end(), [](unsigned char ch) {
+          return (ch >= '0' && ch <= '9') || ch == '.';
+        })) {
+      return "unknown-http-client";
+    }
+
+    constexpr std::string_view prerelease_prefixes[] = {
+        "-dev.local.", "-dev.", ".dev", "-rc.", "-rc", "-beta.", "-alpha.", "-preview."};
+    bool supported_suffix = suffix.empty();
+    for (const auto prefix : prerelease_prefixes) {
+      if (suffix.starts_with(prefix)) {
+        const auto number = suffix.substr(prefix.size());
+        supported_suffix = !number.empty() && number.size() <= 14 &&
+                           std::all_of(number.begin(), number.end(),
+                                       [](unsigned char ch) { return ch >= '0' && ch <= '9'; });
+        break;
+      }
+    }
+
+    if (!supported_suffix) {
+      return "unknown-http-client";
+    }
+
+    return std::string(product) + std::string(release);
+  }
+
+  return "unknown-http-client";
+}
+
+inline std::string GetUserAgent(const std::shared_ptr<HttpRequestHandler::IncomingRequest>& request) {
+  if (!request) {
+    return "unknown-http-client";
+  }
+
+  const auto user_agent = request->getHeader("User-Agent");
+  return user_agent ? SafeHttpUserAgent(*user_agent) : "unknown-http-client";
+}
+
+/// Track construction separately from processing, with the route's indirect context for both.
+template <typename SessionType>
+std::unique_ptr<SessionType> CreateSessionWithTelemetry(const Model& model, GenAIModelInstance& loaded,
+                                                        ServiceContext& ctx, const InvocationContext& context) {
+  ActionTracker tracker(Action::kSessionCreate, ctx.telemetry, context);
+  tracker.SetModelId(model.Id());
+  try {
+    auto session = std::make_unique<SessionType>(model, loaded, ctx.logger, ctx.telemetry);
+    session->SetInvocationContext(context);
+    tracker.SetStatus(ActionStatus::kSuccess);
+    return session;
+  } catch (const std::exception& ex) {
+    tracker.RecordException(ex);
+    throw;
+  }
 }
 
 /// Map a failure raised during request handling to an HTTP status.

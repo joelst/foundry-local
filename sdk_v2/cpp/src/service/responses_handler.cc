@@ -266,11 +266,12 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::LoadPrev
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
     const std::shared_ptr<IncomingRequest>& request) {
-  ActionTracker tracker(Action::kOpenAIResponsesCreate, ctx_.telemetry);
+  const auto route_context = InvocationContext::Direct(GetUserAgent(request));
+  auto tracker = std::make_unique<ActionTracker>(Action::kOpenAIResponsesCreate, ctx_.telemetry, route_context);
 
   auto body_str = request->readBodyToString();
   if (!body_str || body_str->empty()) {
-    tracker.SetStatus(ActionStatus::kClientError);
+    tracker->SetStatus(ActionStatus::kClientError);
     return ErrorResponse(Status::CODE_400, "Empty request body");
   }
 
@@ -281,7 +282,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
   std::vector<fl::ToolDefinition> tool_definitions;
   if (auto err = ParseAndValidateRequest(body_str->c_str(), req_json, params, prepared_request,
                                          tool_definitions)) {
-    tracker.SetStatus(ActionStatus::kClientError);
+    tracker->SetStatus(ActionStatus::kClientError);
     return err;
   }
 
@@ -296,17 +297,17 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
   Model* model = nullptr;
   GenAIModelInstance* loaded = nullptr;
   if (auto err = ResolveModel(model_name, model, loaded)) {
-    tracker.SetStatus(ActionStatus::kClientError);
+    tracker->SetStatus(ActionStatus::kClientError);
     return err;
   }
 
-  tracker.SetModelId(model_name);
+  tracker->SetModelId(model_name);
 
   // 3. Open the response lease. For a continuation this validates the chain and its model before anything is reused,
   //    and registers the request so a concurrent DELETE of any ancestor can refuse its result.
   ResponseLease lease;
   if (auto err = BeginResponse(params, model->Id(), lease)) {
-    tracker.SetStatus(ActionStatus::kClientError);
+    tracker->SetStatus(ActionStatus::kClientError);
     return err;
   }
 
@@ -319,6 +320,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
 
   std::unique_ptr<ChatSession> session = CheckOutCachedSession(params);
 
+  const auto session_context = route_context.AsIndirect();
   try {
     // 5. Rebuild previous context only on a session-cache miss — a live session already holds the conversation in its
     //    transcript and KV cache, so a chain that can no longer be reconstructed from the store is irrelevant there.
@@ -327,7 +329,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
 
     if (!session) {
       if (auto err = LoadPreviousContext(params, previous_context_storage, previous_context)) {
-        tracker.SetStatus(ActionStatus::kClientError);
+        tracker->SetStatus(ActionStatus::kClientError);
         return err;
       }
     }
@@ -341,7 +343,10 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
     }
 
     if (!session) {
-      session = std::make_unique<ChatSession>(*model, *loaded, ctx_.logger, ctx_.telemetry);
+      session = CreateSessionWithTelemetry<ChatSession>(*model, *loaded, ctx_, session_context);
+    } else {
+      // A cached session must take this route's context, not the previous turn's.
+      session->SetInvocationContext(session_context);
     }
 
     // Sessions can be reused via previous_response_id; clear any stale tool defs from the prior
@@ -354,28 +359,33 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
     if (params.stream) {
       ctx_.logger.Log(LogLevel::Debug,
                       fmt::format("Creating streaming response {} for model {}", turn.response_id, model_name));
-      tracker.SetStatus(ActionStatus::kSuccess);
 
-      return HandleStreaming(std::move(session), std::move(session_request), turn, std::move(lease),
-                             params, req_json);
+      return HandleStreaming(std::move(session), std::move(session_request), turn, std::move(lease), params,
+                             req_json, std::move(tracker));
     } else {
       ctx_.logger.Log(LogLevel::Debug,
                       fmt::format("Creating response {} for model {}", turn.response_id, model_name));
 
-      auto response = HandleNonStreaming(std::move(session), session_request, turn, std::move(lease),
-                                         params, req_json);
-      tracker.SetStatus(ActionStatus::kSuccess);
+      auto response = HandleNonStreaming(std::move(session), session_request, turn, std::move(lease), params,
+                                         req_json);
+      tracker->SetStatus(ResponseToActionStatus(response));
 
       return response;
     }
   } catch (const fl::Exception& ex) {
-    tracker.RecordException(ex);
+    if (tracker) {
+      tracker->RecordException(ex);
+    }
+
     const auto status = StatusForException(ex);
 
     if (status.code == Status::CODE_400.code) {
       // An incoherent conversation — an unknown or duplicate tool call ID, or tool arguments that are not a JSON
       // object — is the caller's mistake, so report it the same way the other request validation failures are.
-      tracker.SetStatus(ActionStatus::kClientError);
+      if (tracker) {
+        tracker->SetStatus(ActionStatus::kClientError);
+      }
+
       ctx_.logger.Log(LogLevel::Warning, fmt::format("Response {} rejected: {}", turn.response_id, ex.what()));
       return ErrorResponse(status, "Invalid request", ex.what());
     }
@@ -389,7 +399,9 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::handle(
   } catch (const std::exception& ex) {
     // Not an fl::Exception, so it carries no error code to classify: nothing below reports a client mistake this
     // way, which makes it a service failure by construction.
-    tracker.RecordException(ex);
+    if (tracker) {
+      tracker->RecordException(ex);
+    }
 
     ctx_.logger.Log(LogLevel::Error, fmt::format("Response {} failed: {}", turn.response_id, ex.what()));
 
@@ -444,7 +456,8 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::HandleNo
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::HandleStreaming(
     std::unique_ptr<ChatSession> session, Request session_request, const ResponseTurn& turn,
-    ResponseLease lease, const ResponseCreateParams& params, const nlohmann::json& req_json) {
+    ResponseLease lease, const ResponseCreateParams& params, const nlohmann::json& req_json,
+    std::unique_ptr<ActionTracker> route_tracker) {
   auto body = std::make_shared<SseStreamBody>();
   auto stream = body->Stream();
   auto req = std::make_shared<Request>(std::move(session_request));
@@ -496,7 +509,8 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::HandleSt
                  lease = std::move(lease),
                  should_store, &store,
                  req_copy = std::move(req_copy),
-                 params_copy = std::move(params_copy)]() mutable {
+                 params_copy = std::move(params_copy),
+                 route_tracker = std::move(route_tracker)]() mutable {
     int seq = 2;
     std::string full_text;  // concatenation of all visible runs, used for output_text in completed_response
 
@@ -731,6 +745,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::HandleSt
       session->SetStreamingCallback(callback_fn);
 
       if (stream->IsDisconnected()) {
+        route_tracker->SetStatus(ActionStatus::kCanceled);
         lease.Release();
         stream->Finish();
         reg.Release();
@@ -775,7 +790,9 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::HandleSt
       terminal.response = completed_response;
       push_event(incomplete ? "response.incomplete" : "response.completed", terminal);
 
+      route_tracker->SetStatus(ActionStatus::kSuccess);
     } catch (const std::exception& ex) {
+      route_tracker->RecordException(ex);
       logger.Log(LogLevel::Error,
                  fmt::format("Response {} failed during streaming: {}", turn.response_id, ex.what()));
 
@@ -784,6 +801,9 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ResponsesHandler::HandleSt
       const auto* request_error = dynamic_cast<const fl::Exception*>(&ex);
       const char* error_code = request_error != nullptr ? ErrorTypeForStatus(StatusForException(*request_error))
                                                         : "server_error";
+      if (request_error != nullptr && StatusForException(*request_error).code == Status::CODE_400.code) {
+        route_tracker->SetStatus(ActionStatus::kClientError);
+      }
 
       auto error_response = ResponseConverter::BuildFailedResponseObject(
           turn.response_id, turn.created_at, turn.model_name, params_copy,
@@ -819,7 +839,8 @@ GetResponseHandler::GetResponseHandler(ServiceContext& ctx) : ctx_(ctx) {}
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> GetResponseHandler::handle(
     const std::shared_ptr<IncomingRequest>& request) {
-  ActionTracker tracker(Action::kOpenAIResponsesGet, ctx_.telemetry);
+  ActionTracker tracker(Action::kOpenAIResponsesGet, ctx_.telemetry,
+                        InvocationContext::Direct(GetUserAgent(request)));
 
   auto id = request->getPathVariable("id");
   if (!id) {
@@ -831,6 +852,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> GetResponseHandler::handle
 
   auto response = ctx_.response_store.Get(id->c_str());
   if (!response) {
+    tracker.SetStatus(ActionStatus::kClientError);
     nlohmann::json error_body = {
         {"error", {
                       {"message", "The response '" + std::string(id->c_str()) + "' does not exist."},
@@ -855,7 +877,8 @@ ListResponsesHandler::ListResponsesHandler(ServiceContext& ctx) : ctx_(ctx) {}
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> ListResponsesHandler::handle(
     const std::shared_ptr<IncomingRequest>& request) {
-  ActionTracker tracker(Action::kOpenAIResponsesList, ctx_.telemetry);
+  ActionTracker tracker(Action::kOpenAIResponsesList, ctx_.telemetry,
+                        InvocationContext::Direct(GetUserAgent(request)));
 
   // Parse query parameters
   auto limit_str = request->getQueryParameter("limit", "20");
@@ -910,7 +933,8 @@ DeleteResponseHandler::DeleteResponseHandler(ServiceContext& ctx) : ctx_(ctx) {}
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> DeleteResponseHandler::handle(
     const std::shared_ptr<IncomingRequest>& request) {
-  ActionTracker tracker(Action::kOpenAIResponsesDelete, ctx_.telemetry);
+  ActionTracker tracker(Action::kOpenAIResponsesDelete, ctx_.telemetry,
+                        InvocationContext::Direct(GetUserAgent(request)));
 
   auto id = request->getPathVariable("id");
   if (!id) {
@@ -925,6 +949,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> DeleteResponseHandler::han
   // also refuses any continuation of this conversation that is generating right now.
   auto deleted_ids = ctx_.response_store.DeleteWithDependents(id->c_str());
   if (deleted_ids.empty()) {
+    tracker.SetStatus(ActionStatus::kClientError);
     nlohmann::json error_body = {
         {"error", {
                       {"message", "The response '" + std::string(id->c_str()) + "' does not exist."},
@@ -955,7 +980,8 @@ GetInputItemsHandler::GetInputItemsHandler(ServiceContext& ctx) : ctx_(ctx) {}
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> GetInputItemsHandler::handle(
     const std::shared_ptr<IncomingRequest>& request) {
-  ActionTracker tracker(Action::kOpenAIResponsesGetInputItems, ctx_.telemetry);
+  ActionTracker tracker(Action::kOpenAIResponsesGetInputItems, ctx_.telemetry,
+                        InvocationContext::Direct(GetUserAgent(request)));
 
   auto id = request->getPathVariable("id");
   if (!id) {
@@ -968,6 +994,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> GetInputItemsHandler::hand
   // Check that response exists
   auto response = ctx_.response_store.Get(id->c_str());
   if (!response) {
+    tracker.SetStatus(ActionStatus::kClientError);
     nlohmann::json error_body = {
         {"error", {
                       {"message", "The response '" + std::string(id->c_str()) + "' does not exist."},

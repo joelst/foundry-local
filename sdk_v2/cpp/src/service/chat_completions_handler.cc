@@ -133,11 +133,12 @@ void ChatCompletionsHandler::BuildOpenAIJsonRequest(const std::string& body, con
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::handle(
     const std::shared_ptr<IncomingRequest>& request) {
-  ActionTracker tracker(Action::kOpenAIChatCompletions, ctx_.telemetry);
+  auto route_ctx = InvocationContext::Direct(GetUserAgent(request));
+  auto tracker = std::make_unique<ActionTracker>(Action::kOpenAIChatCompletions, ctx_.telemetry, route_ctx);
 
   auto body_str = request->readBodyToString();
   if (!body_str || body_str->empty()) {
-    tracker.SetStatus(ActionStatus::kClientError);
+    tracker->SetStatus(ActionStatus::kClientError);
     return ErrorResponse(Status::CODE_400, "Empty request body");
   }
 
@@ -148,7 +149,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::ha
   ChatCompletionRequest req;
   Request session_request;
   if (auto err = ParseAndValidateRequest(body_str->c_str(), req, session_request)) {
-    tracker.SetStatus(ActionStatus::kClientError);
+    tracker->SetStatus(ActionStatus::kClientError);
     return err;
   }
 
@@ -162,10 +163,11 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::ha
   Model* model = nullptr;
   GenAIModelInstance* loaded = nullptr;
   if (auto err = ResolveModel(model_name, model, loaded)) {
+    tracker->SetStatus(ActionStatus::kClientError);
     return err;
   }
 
-  tracker.SetModelId(model_name);
+  tracker->SetModelId(model_name);
 
   // 3. Build an OPENAI_JSON-tagged TEXT request item.
   BuildOpenAIJsonRequest(body_str->c_str(), req, *model, session_request);
@@ -176,27 +178,39 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::ha
     include_usage_in_stream = req.stream_options->include_usage;
   }
 
+  // The session and the inference it drives happen as a consequence of this
+  // route, so they are indirect and reuse the route's correlation id.
+  auto session_ctx = route_ctx.AsIndirect();
+
   // 6. Run inference via ChatSession
   try {
-    ChatSession session(*model, *loaded, ctx_.logger, ctx_.telemetry);
+    auto session = CreateSessionWithTelemetry<ChatSession>(*model, *loaded, ctx_, session_ctx);
 
     if (stream) {
-      tracker.SetStatus(ActionStatus::kSuccess);
-      return HandleStreaming(std::move(session), std::move(session_request), include_usage_in_stream);
+      // The route action is recorded by the streaming thread when the stream
+      // finishes, so don't set its status here — move the tracker into the thread.
+      return HandleStreaming(std::move(*session), std::move(session_request), include_usage_in_stream,
+                             std::move(tracker));
     } else {
-      SessionRegistration reg(ctx_.session_manager, session);
-      auto response = HandleNonStreaming(session, session_request);
-      tracker.SetStatus(ActionStatus::kSuccess);
+      SessionRegistration reg(ctx_.session_manager, *session);
+      auto response = HandleNonStreaming(*session, session_request);
+      tracker->SetStatus(ResponseToActionStatus(response));
       return response;
     }
   } catch (const fl::Exception& ex) {
-    tracker.RecordException(ex);
+    if (tracker) {
+      tracker->RecordException(ex);
+    }
+
     const auto status = StatusForException(ex);
 
     if (status.code == Status::CODE_400.code) {
       // An incoherent conversation — an unknown or duplicate tool call ID, or tool arguments that are not a JSON
       // object — is the caller's mistake, not a service failure.
-      tracker.SetStatus(ActionStatus::kClientError);
+      if (tracker) {
+        tracker->SetStatus(ActionStatus::kClientError);
+      }
+
       ctx_.logger.Log(LogLevel::Warning, fmt::format("Chat completion request rejected: {}", ex.what()));
       return ErrorResponse(status, "Invalid request", ex.what());
     }
@@ -206,7 +220,10 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::ha
   } catch (const std::exception& ex) {
     // Not an fl::Exception, so it carries no error code to classify: nothing below reports a client mistake this
     // way, which makes it a service failure by construction.
-    tracker.RecordException(ex);
+    if (tracker) {
+      tracker->RecordException(ex);
+    }
+
     ctx_.logger.Log(LogLevel::Error, fmt::format("Chat completion inference failed: {}", ex.what()));
 
     return ErrorResponse(Status::CODE_500, "Inference failed", ex.what());
@@ -237,7 +254,8 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::Ha
 }
 
 std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::HandleStreaming(
-    ChatSession&& session, Request session_request, bool include_usage) {
+    ChatSession&& session, Request session_request, bool include_usage,
+    std::unique_ptr<ActionTracker> route_tracker) {
   auto body = std::make_shared<SseStreamBody>();
   auto stream = body->Stream();
   auto req = std::make_shared<Request>(std::move(session_request));
@@ -245,9 +263,8 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::Ha
   auto& logger = ctx_.logger;
   auto& tracker = ctx_.thread_tracker;
 
-  tracker.Start([bg_session = std::move(session), stream, &logger,
-                 req,
-                 include_usage,
+  tracker.Start([bg_session = std::move(session), stream, &logger, req, include_usage,
+                 route_tracker = std::move(route_tracker),
                  &session_manager = ctx_.session_manager]() mutable {
     try {
       // Register inside the try so a shutdown rejection (Register throws) is reported as a stream error
@@ -277,6 +294,7 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::Ha
 
       bg_session.SetStreamingCallback(callback_fn);
       if (stream->IsDisconnected()) {
+        route_tracker->SetStatus(ActionStatus::kCanceled);
         stream->Finish();
         reg.Release();
         return;
@@ -310,6 +328,11 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::Ha
       }
 
       stream->Push("data: [DONE]\n\n");
+
+      // Record final route status after streaming completes.
+      if (route_tracker) {
+        route_tracker->SetStatus(ActionStatus::kSuccess);
+      }
     } catch (const std::exception& ex) {
       // The status line is already sent, so a rejected request can only be reported in the event payload. Keep the
       // error type honest so the caller can tell a client mistake from a service failure.
@@ -320,6 +343,11 @@ std::shared_ptr<HttpRequestHandler::OutgoingResponse> ChatCompletionsHandler::Ha
           {"error", {{"message", ex.what()}, {"type", error_type}, {"param", nullptr}, {"code", nullptr}}},
       };
       stream->Push("data: " + err.dump() + "\n\n");
+
+      // Preserve exception-based classification for cancellation, client errors and dependency failures.
+      if (route_tracker) {
+        route_tracker->RecordException(ex);
+      }
     }
 
     stream->Finish();
