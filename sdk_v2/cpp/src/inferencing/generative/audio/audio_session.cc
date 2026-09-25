@@ -70,7 +70,7 @@ std::optional<double> TryParseWhisperTimestampToken(const std::string& token) {
   char* parse_end = nullptr;
   errno = 0;
   double seconds = std::strtod(inner.c_str(), &parse_end);
-  if (parse_end != inner.c_str() + inner.size() || errno == ERANGE) {
+  if (parse_end != inner.c_str() + inner.size() || errno == ERANGE || !std::isfinite(seconds) || seconds < 0.0) {
     return std::nullopt;
   }
 

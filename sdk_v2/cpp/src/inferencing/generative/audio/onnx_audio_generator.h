@@ -3,12 +3,15 @@
 #pragma once
 
 #include "inferencing/generative/audio/audio_generator.h"
+#include "inferencing/generative/audio/whisper_timestamp_rules.h"
 #include "inferencing/generative/genai_model_instance.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 // Forward declarations — avoid pulling ort_genai.h into the header
 struct OgaGenerator;
@@ -62,7 +65,11 @@ class OnnxAudioGenerator : public AudioGenerator {
                      std::unique_ptr<OgaGeneratorParams> gen_params,
                      std::unique_ptr<OgaGenerator> generator,
                      std::unique_ptr<OgaTokenizerStream> stream,
-                     int prompt_token_count);
+                     int prompt_token_count,
+                     std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens);
+
+  /// Mask next-token logits with Whisper's timestamp rules so the decoder emits <|X.XX|> segment boundaries.
+  void ApplyTimestampRules();
 
   // Destruction is reverse-declaration order. audios_ and inputs_ are declared first
   // so they are destroyed last — the generator holds pointers into them.
@@ -72,6 +79,8 @@ class OnnxAudioGenerator : public AudioGenerator {
   std::unique_ptr<OgaGenerator> generator_;
   std::unique_ptr<OgaTokenizerStream> stream_;
   int prompt_token_count_ = 0;
+  std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens_;
+  std::vector<int32_t> generated_tokens_;  // tokens generated after the prompt, input to the timestamp rules
   std::atomic<bool> cancelled_{false};
 };
 

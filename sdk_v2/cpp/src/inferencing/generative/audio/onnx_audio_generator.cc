@@ -4,6 +4,7 @@
 #include "exception.h"
 
 #include <ort_genai.h>
+#include <span>
 #include <unordered_set>
 
 namespace fl {
@@ -29,10 +30,35 @@ static std::string BuildWhisperPrompt(const std::string& language) {
   // Default to English when language is empty or unrecognized
   const auto& lang = (!language.empty() && AudioInternal::IsWhisperLanguageSupported(language)) ? language : "en";
 
-  // Omitting <|notimestamps|> lets Whisper emit its native <|X.XX|> timestamp tokens
-  // around each segment, which AudioSession::ProcessRequestImpl uses to populate
-  // SpeechSegmentItem::start_time_ms / end_time_ms (see TryParseWhisperTimestampToken).
+  // Omitting <|notimestamps|> is necessary but not sufficient: greedy decoding still picks <|notimestamps|> as the
+  // first generated token, so OnnxAudioGenerator also applies ApplyWhisperTimestampRules to the logits. The resulting
+  // <|X.XX|> tokens populate SpeechSegmentItem::start_time_ms / end_time_ms (see TryParseWhisperTimestampToken).
   return "<|startoftranscript|><|" + lang + "|><|transcribe|>";
+}
+
+// Resolve a special token to its model-specific ID; nullopt when it does not encode to exactly one token.
+static std::optional<int32_t> ResolveSingleToken(Preprocessor& preprocessor, const char* token) {
+  auto sequences = preprocessor.Encode(token);
+  if (sequences->Count() != 1 || sequences->SequenceCount(0) != 1) {
+    return std::nullopt;
+  }
+
+  return sequences->SequenceData(0)[0];
+}
+
+static std::optional<AudioInternal::WhisperTimestampTokens> ResolveWhisperTimestampTokens(Preprocessor& preprocessor) {
+  auto eot = ResolveSingleToken(preprocessor, "<|endoftext|>");
+  auto no_timestamps = ResolveSingleToken(preprocessor, "<|notimestamps|>");
+  auto timestamp_begin = ResolveSingleToken(preprocessor, "<|0.00|>");
+  if (!eot || !no_timestamps || !timestamp_begin) {
+    return std::nullopt;
+  }
+
+  return AudioInternal::WhisperTimestampTokens{
+      .eot = *eot,
+      .no_timestamps = *no_timestamps,
+      .timestamp_begin = *timestamp_begin,
+  };
 }
 
 // Declared out-of-line so unique_ptr deleters see the complete OGA types.
@@ -49,13 +75,15 @@ OnnxAudioGenerator::OnnxAudioGenerator(std::unique_ptr<OgaAudios> audios,
                                        std::unique_ptr<OgaGeneratorParams> gen_params,
                                        std::unique_ptr<OgaGenerator> generator,
                                        std::unique_ptr<OgaTokenizerStream> stream,
-                                       int prompt_token_count)
+                                       int prompt_token_count,
+                                       std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens)
     : audios_(std::move(audios)),
       inputs_(std::move(inputs)),
       gen_params_(std::move(gen_params)),
       generator_(std::move(generator)),
       stream_(std::move(stream)),
-      prompt_token_count_(prompt_token_count) {}
+      prompt_token_count_(prompt_token_count),
+      timestamp_tokens_(timestamp_tokens) {}
 
 // ---------------------------------------------------------------------------
 // AudioGenerator interface
@@ -78,7 +106,16 @@ void OnnxAudioGenerator::GenerateNextToken() {
   }
 
   try {
+    if (timestamp_tokens_) {
+      ApplyTimestampRules();
+    }
+
     generator_->GenerateNextToken();
+
+    auto next_tokens = generator_->GetNextTokens();
+    if (!next_tokens.empty()) {
+      generated_tokens_.push_back(next_tokens[0]);
+    }
   } catch (const std::runtime_error& e) {
     // If cancelled while generating, the OGA engine throws when the session is terminated.
     // This is expected — not an error.
@@ -88,6 +125,31 @@ void OnnxAudioGenerator::GenerateNextToken() {
 
     FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, std::string("audio token generation failed: ") + e.what());
   }
+}
+
+void OnnxAudioGenerator::ApplyTimestampRules() {
+  // GetLogits returns a CPU copy holding only the last position's logits; SetLogits copies it back to the device.
+  auto logits = generator_->GetLogits();
+  if (logits->Type() != OgaElementType_float32) {
+    return;
+  }
+
+  auto shape = logits->Shape();
+  if (shape.empty() || shape.back() <= 0) {
+    return;
+  }
+
+  size_t total = 1;
+  for (auto dim : shape) {
+    total *= static_cast<size_t>(dim);
+  }
+
+  // Batch size is always 1 for file transcription, so the last vocab-sized row is the only sequence.
+  const auto vocab = static_cast<size_t>(shape.back());
+  auto* data = static_cast<float*>(logits->Data());
+  AudioInternal::ApplyWhisperTimestampRules(std::span<float>(data + (total - vocab), vocab), generated_tokens_,
+                                            *timestamp_tokens_);
+  generator_->SetLogits(*logits);
 }
 
 std::string OnnxAudioGenerator::Decode() {
@@ -178,8 +240,13 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
   // 6. Capture prompt token count after inputs are set
   int prompt_token_count = static_cast<int>(generator->GetSequenceCount(0));
 
-  // 7. Create tokenizer stream for decoding (no special-token stream needed for audio)
+  // 7. Create tokenizer stream for decoding. Timestamp tokens (<|X.XX|>) decode to literal text through the regular
+  //    stream, so no special-token stream is needed.
   auto stream = model.GetPreprocessor().CreateTokenizerStream();
+
+  // 8. Resolve model-specific timestamp token IDs. If they cannot be resolved, transcription still works but no
+  //    timestamps are produced.
+  auto timestamp_tokens = ResolveWhisperTimestampTokens(model.GetPreprocessor());
 
   // `std::make_unique` cannot access the private constructor, so use `new` directly.
   return std::unique_ptr<OnnxAudioGenerator>(new OnnxAudioGenerator(std::move(audios),
@@ -187,7 +254,8 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
                                                                     std::move(gen_params),
                                                                     std::move(generator),
                                                                     std::move(stream),
-                                                                    prompt_token_count));
+                                                                    prompt_token_count,
+                                                                    timestamp_tokens));
 }
 
 }  // namespace fl

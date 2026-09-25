@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <limits>
 #include <optional>
@@ -892,7 +893,7 @@ TEST_F(AudioSessionInferenceTest, TranscribeFromFilePathPopulatesSegmentTimestam
   ASSERT_FALSE(result->segments.empty()) << "Expected at least one speech segment";
 
   std::int64_t previous_end_ms = -1;
-  bool saw_timed_segment = false;
+  int timed_segments = 0;
   for (const auto& segment : result->segments) {
     ASSERT_NE(segment, nullptr);
     EXPECT_EQ(segment->text.find("<|"), std::string::npos)
@@ -901,15 +902,20 @@ TEST_F(AudioSessionInferenceTest, TranscribeFromFilePathPopulatesSegmentTimestam
     if (segment->kind == FOUNDRY_LOCAL_SPEECH_SEGMENT_FINAL) {
       ASSERT_TRUE(segment->start_time_ms.has_value()) << "FINAL segment missing start_time_ms";
       ASSERT_TRUE(segment->end_time_ms.has_value()) << "FINAL segment missing end_time_ms";
-      EXPECT_GE(*segment->end_time_ms, *segment->start_time_ms);
+      std::cout << "[segment] " << *segment->start_time_ms << "-" << *segment->end_time_ms << " ms: "
+                << segment->text << "\n";
+      EXPECT_GT(*segment->end_time_ms, *segment->start_time_ms);
       EXPECT_GE(*segment->start_time_ms, previous_end_ms)
           << "Segment timestamps should be monotonically non-decreasing";
       previous_end_ms = *segment->end_time_ms;
-      saw_timed_segment = true;
+      ++timed_segments;
     }
   }
 
-  EXPECT_TRUE(saw_timed_segment) << "Expected at least one FINAL segment with real timestamps";
+  // Recording.mp3 is ~15.5 s of speech across three sentences; Whisper splits it into multiple timed segments.
+  EXPECT_GE(timed_segments, 2) << "Expected multiple FINAL segments with real timestamps";
+  EXPECT_GT(previous_end_ms, 10000) << "Last segment should end near the end of the ~15.5 s recording";
+  EXPECT_LE(previous_end_ms, 16500) << "Last segment should not end past the ~15.5 s recording";
   EXPECT_EQ(response.finish_reason, FOUNDRY_LOCAL_FINISH_STOP);
 }
 
