@@ -25,6 +25,7 @@ namespace fl {
 namespace AudioInternal {
 
 bool IsWhisperLanguageSupported(const std::string& language);
+std::string BuildWhisperPrompt(const std::string& language, bool enable_timestamps);
 
 }  // namespace AudioInternal
 

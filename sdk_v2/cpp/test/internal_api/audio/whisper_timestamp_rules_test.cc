@@ -9,6 +9,7 @@
 //
 
 #include "inferencing/generative/audio/whisper_timestamp_rules.h"
+#include "inferencing/generative/audio/onnx_audio_generator.h"
 
 #include <gtest/gtest.h>
 
@@ -68,6 +69,11 @@ int Argmax(const std::vector<float>& logits) {
 }
 
 }  // namespace
+
+TEST(WhisperTimestampRulesTest, PromptFallsBackToNoTimestampsWhenRulesAreUnavailable) {
+  EXPECT_EQ(BuildWhisperPrompt("en", false), "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>");
+  EXPECT_EQ(BuildWhisperPrompt("en", true), "<|startoftranscript|><|en|><|transcribe|>");
+}
 
 TEST(WhisperTimestampRulesTest, FirstStepForcesInitialTimestamp) {
   // Mirrors the real failure: <|notimestamps|> is the greedy choice without the rules.

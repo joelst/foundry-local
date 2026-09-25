@@ -340,7 +340,8 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
 
       if (current_segment_start_ms.has_value()) {
         if (HasNonWhitespace(current_segment_text)) {
-          segments.push_back(MakeTimedSegment(current_segment_text, *current_segment_start_ms, boundary_ms));
+          token_texts.push_back(current_segment_text);
+          segments.push_back(MakeTimedSegment(std::move(current_segment_text), *current_segment_start_ms, boundary_ms));
         }
 
         current_segment_text.clear();
@@ -349,7 +350,6 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
       current_segment_start_ms = boundary_ms;
     } else if (!token.empty()) {
       current_segment_text += token;
-      token_texts.push_back(token);
 
       // Preserve existing per-token streaming granularity. Whisper's timestamps only
       // bound whole segments, not individual words, so NONE remains the honest kind
@@ -368,7 +368,8 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
   // that never emitted a final boundary token. Preserve it in the result rather
   // than silently dropping it; NONE is honest since the segment never closed.
   if (HasNonWhitespace(current_segment_text)) {
-    segments.push_back(MakeTrailingSegment(current_segment_text, current_segment_start_ms));
+    token_texts.push_back(current_segment_text);
+    segments.push_back(MakeTrailingSegment(std::move(current_segment_text), current_segment_start_ms));
   }
 
   int total_tokens = generator->TokenCount();

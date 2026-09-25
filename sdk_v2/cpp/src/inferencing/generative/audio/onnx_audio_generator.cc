@@ -29,14 +29,16 @@ bool AudioInternal::IsWhisperLanguageSupported(const std::string& language) {
 
 /// Build the special-token prompt that tells Whisper what task to perform.
 /// Defaults to English when no language is provided or language is unrecognized.
-static std::string BuildWhisperPrompt(const std::string& language) {
+std::string AudioInternal::BuildWhisperPrompt(const std::string& language, bool enable_timestamps) {
   // Default to English when language is empty or unrecognized
   const auto& lang = (!language.empty() && AudioInternal::IsWhisperLanguageSupported(language)) ? language : "en";
 
-  // Omitting <|notimestamps|> is necessary but not sufficient: greedy decoding still picks <|notimestamps|> as the
-  // first generated token, so OnnxAudioGenerator also applies ApplyWhisperTimestampRules to the logits. The resulting
-  // <|X.XX|> tokens populate SpeechSegmentItem::start_time_ms / end_time_ms (see TryParseWhisperTimestampToken).
-  return "<|startoftranscript|><|" + lang + "|><|transcribe|>";
+  std::string prompt = "<|startoftranscript|><|" + lang + "|><|transcribe|>";
+  if (!enable_timestamps) {
+    prompt += "<|notimestamps|>";
+  }
+
+  return prompt;
 }
 
 // Resolve a special token to its model-specific ID; nullopt when it does not encode to exactly one token.
@@ -215,25 +217,29 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
   std::vector<const char*> paths = {audio_file_path.c_str()};
   auto audios = OgaAudios::Load(paths);
 
-  // 2. Build the Whisper prompt with optional language tag.
+  // 2. Resolve model-specific timestamp token IDs before building the prompt. If resolution fails, retain the previous
+  //    <|notimestamps|> behavior rather than allowing the model to emit an unmasked control token into user-visible text.
+  auto timestamp_tokens = ResolveWhisperTimestampTokens(model.GetPreprocessor());
+
+  // 3. Build the Whisper prompt with optional language tag.
   //    Use the multi-prompt overload (vector) with size 1 — the single-prompt overload
   //    sets Payload::prompt but WhisperProcessor::Process reads Payload::prompts,
   //    which would be empty and cause a divide-by-zero in EncodeBatch.
   //    https://github.com/microsoft/onnxruntime-genai/issues/2067
-  std::string prompt = BuildWhisperPrompt(language);
+  std::string prompt = AudioInternal::BuildWhisperPrompt(language, timestamp_tokens.has_value());
   std::vector<const char*> prompts = {prompt.c_str()};
 
-  // 3. Process audio through the multimodal processor to get model inputs
+  // 4. Process audio through the multimodal processor to get model inputs
   auto inputs = model.GetPreprocessor().ProcessAudios(prompts, audios.get());
 
-  // 4. Create generator params and configure temperature (only override model default if explicitly set)
+  // 5. Create generator params and configure temperature (only override model default if explicitly set)
   auto gen_params = OgaGeneratorParams::Create(model.GetOgaModel());
 
   if (temperature.has_value()) {
     gen_params->SetSearchOption("temperature", *temperature);
   }
 
-  // 5. Create the generator and feed it the processed inputs
+  // 6. Create the generator and feed it the processed inputs
   std::unique_ptr<OgaGenerator> generator;
 
   try {
@@ -243,16 +249,12 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
     FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, std::string("failed to create audio generator: ") + e.what());
   }
 
-  // 6. Capture prompt token count after inputs are set
+  // 7. Capture prompt token count after inputs are set
   int prompt_token_count = static_cast<int>(generator->GetSequenceCount(0));
 
-  // 7. Create tokenizer stream for decoding. Timestamp tokens (<|X.XX|>) decode to literal text through the regular
+  // 8. Create tokenizer stream for decoding. Timestamp tokens (<|X.XX|>) decode to literal text through the regular
   //    stream, so no special-token stream is needed.
   auto stream = model.GetPreprocessor().CreateTokenizerStream();
-
-  // 8. Resolve model-specific timestamp token IDs. If they cannot be resolved, transcription still works but no
-  //    timestamps are produced.
-  auto timestamp_tokens = ResolveWhisperTimestampTokens(model.GetPreprocessor());
 
   // 9. Audio end in timestamp steps, capped at the single 30 s window this generator decodes. Only WAV headers are
   //    probed; for other formats the end is unknown and the timestamp rules fall back to the reference EOT behavior.
