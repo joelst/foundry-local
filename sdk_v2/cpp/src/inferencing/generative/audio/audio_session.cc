@@ -21,9 +21,13 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
 #include <ort_genai.h>
@@ -42,6 +46,50 @@ namespace {
 // the honest label.
 std::unique_ptr<SpeechSegmentItem> MakeNoneSegment(std::string text) {
   auto seg = std::make_unique<SpeechSegmentItem>(FOUNDRY_LOCAL_SPEECH_SEGMENT_NONE, std::move(text));
+  seg->Finalize();
+  return seg;
+}
+
+// Whisper timestamp tokens are decoded as literal "<|X.XX|>" text (seconds, 0.02s
+// resolution) once the prompt omits <|notimestamps|> (see BuildWhisperPrompt in
+// onnx_audio_generator.cc). Every other special token the tokenizer can emit here
+// (language, task) is non-numeric between the pipes, so a successful parse of the
+// inner text as a float disambiguates a timestamp marker from those.
+std::optional<double> TryParseWhisperTimestampToken(const std::string& token) {
+  if (token.size() < 5 || token.compare(0, 2, "<|") != 0 || token.compare(token.size() - 2, 2, "|>") != 0) {
+    return std::nullopt;
+  }
+
+  std::string inner = token.substr(2, token.size() - 4);
+  if (inner.empty()) {
+    return std::nullopt;
+  }
+
+  char* parse_end = nullptr;
+  errno = 0;
+  double seconds = std::strtod(inner.c_str(), &parse_end);
+  if (parse_end != inner.c_str() + inner.size() || errno == ERANGE) {
+    return std::nullopt;
+  }
+
+  return seconds;
+}
+
+// Build a FINAL segment bounded by two Whisper timestamp tokens.
+std::unique_ptr<SpeechSegmentItem> MakeTimedSegment(std::string text, std::int64_t start_ms, std::int64_t end_ms) {
+  auto seg = std::make_unique<SpeechSegmentItem>(FOUNDRY_LOCAL_SPEECH_SEGMENT_FINAL, std::move(text));
+  seg->start_time_ms = start_ms;
+  seg->end_time_ms = end_ms;
+  seg->Finalize();
+  return seg;
+}
+
+// Build a NONE segment for text that never reached a closing timestamp (e.g.
+// cancellation mid-segment). `start_ms` is set when the opening timestamp was seen,
+// so partial timing information is preserved rather than discarded.
+std::unique_ptr<SpeechSegmentItem> MakeTrailingSegment(std::string text, std::optional<std::int64_t> start_ms) {
+  auto seg = std::make_unique<SpeechSegmentItem>(FOUNDRY_LOCAL_SPEECH_SEGMENT_NONE, std::move(text));
+  seg->start_time_ms = start_ms;
   seg->Finalize();
   return seg;
 }
@@ -248,23 +296,48 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
   std::vector<std::unique_ptr<SpeechSegmentItem>> segments;
   segments.reserve(kInitialTokenCapacity);
 
+  // Whisper emits a <|X.XX|> timestamp token before and after each segment (see
+  // BuildWhisperPrompt). current_segment_start_ms is set on the opening timestamp;
+  // the next timestamp closes the segment and current_segment_text is flushed into
+  // a FINAL SpeechSegmentItem with real start/end times.
+  std::string current_segment_text;
+  std::optional<std::int64_t> current_segment_start_ms;
+
   while (!generator->IsDone() && !request.IsCancellationRequested()) {
     generator->GenerateNextToken();
     std::string token = generator->Decode();
 
-    if (!token.empty()) {
-      segments.push_back(MakeNoneSegment(token));
+    if (auto timestamp_seconds = TryParseWhisperTimestampToken(token)) {
+      auto boundary_ms = static_cast<std::int64_t>(std::llround(*timestamp_seconds * 1000.0));
 
-      if (streaming_callback) {
-        streaming_callback->PushItem(MakeNoneSegment(token));
+      if (current_segment_start_ms.has_value() && !current_segment_text.empty()) {
+        segments.push_back(MakeTimedSegment(current_segment_text, *current_segment_start_ms, boundary_ms));
+        current_segment_text.clear();
       }
 
-      token_texts.push_back(std::move(token));
+      current_segment_start_ms = boundary_ms;
+    } else if (!token.empty()) {
+      current_segment_text += token;
+      token_texts.push_back(token);
+
+      // Preserve existing per-token streaming granularity. Whisper's timestamps only
+      // bound whole segments, not individual words, so NONE remains the honest kind
+      // for these interim pushes.
+      if (streaming_callback) {
+        streaming_callback->PushItem(MakeNoneSegment(std::move(token)));
+      }
     }
 
     if (request.IsCancellationRequested()) {
       generator->Cancel();
     }
+  }
+
+  // Trailing text with no closing timestamp: cancellation, or a model/decode path
+  // that never emitted a final boundary token. Preserve it in the result rather
+  // than silently dropping it; NONE is honest since the segment never closed.
+  if (!current_segment_text.empty()) {
+    segments.push_back(MakeTrailingSegment(current_segment_text, current_segment_start_ms));
   }
 
   int total_tokens = generator->TokenCount();
@@ -511,6 +584,15 @@ void AudioSession::ProcessAudioTranscriptionJson(const std::string& request_json
   while (!generator->IsDone() && !original_request.IsCancellationRequested()) {
     generator->GenerateNextToken();
     std::string token = generator->Decode();
+
+    // This response contract has no segments/timestamps field yet (tracked separately);
+    // Whisper's <|X.XX|> timestamp tokens must still be excluded from the plain text.
+    if (TryParseWhisperTimestampToken(token)) {
+      if (original_request.IsCancellationRequested()) {
+        generator->Cancel();
+      }
+      continue;
+    }
 
     if (!token.empty()) {
       text += token;

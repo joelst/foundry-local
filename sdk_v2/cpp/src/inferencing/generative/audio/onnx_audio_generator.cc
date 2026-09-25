@@ -28,7 +28,10 @@ static std::string BuildWhisperPrompt(const std::string& language) {
   // Default to English when language is empty or unrecognized
   const auto& lang = (!language.empty() && kValidLanguages.contains(language)) ? language : "en";
 
-  return "<|startoftranscript|><|" + lang + "|><|transcribe|><|notimestamps|>";
+  // Omitting <|notimestamps|> lets Whisper emit its native <|X.XX|> timestamp tokens
+  // around each segment, which AudioSession::ProcessRequestImpl uses to populate
+  // SpeechSegmentItem::start_time_ms / end_time_ms (see TryParseWhisperTimestampToken).
+  return "<|startoftranscript|><|" + lang + "|><|transcribe|>";
 }
 
 // Declared out-of-line so unique_ptr deleters see the complete OGA types.
