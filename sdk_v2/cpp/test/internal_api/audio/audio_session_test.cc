@@ -897,6 +897,8 @@ TEST_F(AudioSessionInferenceTest, TranscribeFromFilePathPopulatesSegmentTimestam
   int timed_segments = 0;
   for (const auto& segment : result->segments) {
     ASSERT_NE(segment, nullptr);
+    EXPECT_EQ(segment->kind, FOUNDRY_LOCAL_SPEECH_SEGMENT_FINAL)
+        << "Completed Whisper transcription should not contain an untimed trailing segment";
     EXPECT_EQ(segment->text.find("<|"), std::string::npos)
         << "Segment text leaked a timestamp marker: " << segment->text;
     EXPECT_TRUE(std::any_of(segment->text.begin(), segment->text.end(),

@@ -13,7 +13,8 @@ namespace fl::AudioInternal {
 struct WhisperTimestampTokens {
   int32_t eot = 0;              // <|endoftext|>
   int32_t no_timestamps = 0;    // <|notimestamps|>
-  int32_t timestamp_begin = 0;  // <|0.00|>; every ID >= this is a timestamp in 0.02s steps
+  int32_t timestamp_begin = 0;  // <|0.00|>
+  int32_t timestamp_end = 0;    // <|30.00|>
 };
 
 /// Whisper's default `max_initial_timestamp` of 1.0s expressed in 0.02s timestamp steps.
@@ -25,8 +26,15 @@ inline constexpr double kWhisperTimestampStepSeconds = 0.02;
 /// Last timestamp index of a single 30 s Whisper window.
 inline constexpr int kWhisperWindowTimestampSteps = 1500;
 
-/// Minimum audio (1.0 s) that must remain after an opening timestamp for EOT to be masked there.
+/// EOT is masked only when strictly more than 1.0 s remains after an opening timestamp.
 inline constexpr int kWhisperMinRemainingAudioTimestampSteps = 50;
+
+/// Whether the resolved token IDs match Whisper's expected control-token ordering and 30 s timestamp range.
+bool IsValidWhisperTimestampTokens(const WhisperTimestampTokens& tokens);
+
+/// Convert a verified Whisper timestamp token ID to milliseconds, or nullopt for a non-timestamp token or invalid
+/// token layout.
+std::optional<int64_t> WhisperTimestampMilliseconds(int32_t token, const WhisperTimestampTokens& tokens);
 
 /// Apply OpenAI Whisper's timestamp decoding rules (ApplyTimestampRules in openai/whisper decoding.py) to one row of
 /// next-token logits, in place. Without these rules, greedy decoding picks `<|notimestamps|>` as the first token even
@@ -37,10 +45,10 @@ inline constexpr int kWhisperMinRemainingAudioTimestampSteps = 50;
 /// than `max_initial_timestamp_index`; and a timestamp is forced whenever the total timestamp probability exceeds the
 /// most likely text token.
 ///
-/// @param logits     Next-token logits for a single sequence (length = vocab size).
 /// One deliberate deviation: the reference ends a window with EOT right after an opening timestamp pair and then
 /// re-decodes the rest of the audio from that timestamp. There is no such seek loop here, so EOT is masked after a
-/// pair while at least `kWhisperMinRemainingAudioTimestampSteps` of audio remain before `audio_end_timestamp_index`.
+/// pair while more than `kWhisperMinRemainingAudioTimestampSteps` of audio remain before
+/// `audio_end_timestamp_index`.
 ///
 /// @param logits     Next-token logits for a single sequence (length = vocab size).
 /// @param generated  Tokens generated so far, excluding the prompt.

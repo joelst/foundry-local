@@ -48,6 +48,9 @@ class OnnxAudioGenerator : public AudioGenerator {
   int PromptTokenCount() const override;
   void Cancel() override;
 
+  /// Timestamp represented by the most recently generated token, or nullopt when it was not a timestamp.
+  std::optional<int64_t> LastTimestampMilliseconds() const;
+
   /// Factory: create a fully configured generator for audio transcription from a file.
   ///
   /// @param audio_file_path  Path to the audio file on disk
@@ -70,7 +73,7 @@ class OnnxAudioGenerator : public AudioGenerator {
                      std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens,
                      std::optional<int> audio_end_timestamp_index);
 
-  /// Mask next-token logits with Whisper's timestamp rules so the decoder emits <|X.XX|> segment boundaries.
+  /// Mask next-token logits with Whisper's timestamp rules so the decoder emits timed segment boundaries.
   void ApplyTimestampRules();
 
   // Destruction is reverse-declaration order. audios_ and inputs_ are declared first
@@ -84,6 +87,7 @@ class OnnxAudioGenerator : public AudioGenerator {
   std::optional<AudioInternal::WhisperTimestampTokens> timestamp_tokens_;
   std::optional<int> audio_end_timestamp_index_;  // audio end in 0.02s steps, capped at one window; nullopt if unknown
   std::vector<int32_t> generated_tokens_;  // tokens generated after the prompt, input to the timestamp rules
+  std::optional<int32_t> last_generated_token_;
   std::atomic<bool> cancelled_{false};
 };
 

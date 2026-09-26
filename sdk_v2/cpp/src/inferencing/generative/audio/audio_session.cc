@@ -23,10 +23,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cctype>
-#include <cerrno>
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <optional>
@@ -50,31 +47,6 @@ std::unique_ptr<SpeechSegmentItem> MakeNoneSegment(std::string text) {
   auto seg = std::make_unique<SpeechSegmentItem>(FOUNDRY_LOCAL_SPEECH_SEGMENT_NONE, std::move(text));
   seg->Finalize();
   return seg;
-}
-
-// Whisper timestamp tokens are decoded as literal "<|X.XX|>" text (seconds, 0.02s
-// resolution) once the prompt omits <|notimestamps|> (see BuildWhisperPrompt in
-// onnx_audio_generator.cc). Every other special token the tokenizer can emit here
-// (language, task) is non-numeric between the pipes, so a successful parse of the
-// inner text as a float disambiguates a timestamp marker from those.
-std::optional<double> TryParseWhisperTimestampToken(const std::string& token) {
-  if (token.size() < 5 || token.compare(0, 2, "<|") != 0 || token.compare(token.size() - 2, 2, "|>") != 0) {
-    return std::nullopt;
-  }
-
-  std::string inner = token.substr(2, token.size() - 4);
-  if (inner.empty()) {
-    return std::nullopt;
-  }
-
-  char* parse_end = nullptr;
-  errno = 0;
-  double seconds = std::strtod(inner.c_str(), &parse_end);
-  if (parse_end != inner.c_str() + inner.size() || errno == ERANGE || !std::isfinite(seconds) || seconds < 0.0) {
-    return std::nullopt;
-  }
-
-  return seconds;
 }
 
 // Whisper often emits a lone space token between the last timestamp and EOT; such text carries no content and
@@ -335,19 +307,17 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
     generator->GenerateNextToken();
     std::string token = generator->Decode();
 
-    if (auto timestamp_seconds = TryParseWhisperTimestampToken(token)) {
-      auto boundary_ms = static_cast<std::int64_t>(std::llround(*timestamp_seconds * 1000.0));
-
+    if (auto boundary_ms = generator->LastTimestampMilliseconds()) {
       if (current_segment_start_ms.has_value()) {
         if (HasNonWhitespace(current_segment_text)) {
           token_texts.push_back(current_segment_text);
-          segments.push_back(MakeTimedSegment(std::move(current_segment_text), *current_segment_start_ms, boundary_ms));
+          segments.push_back(MakeTimedSegment(std::move(current_segment_text), *current_segment_start_ms, *boundary_ms));
         }
 
         current_segment_text.clear();
       }
 
-      current_segment_start_ms = boundary_ms;
+      current_segment_start_ms = *boundary_ms;
     } else if (!token.empty()) {
       current_segment_text += token;
 
@@ -632,9 +602,9 @@ void AudioSession::ProcessAudioTranscriptionJson(const std::string& request_json
     generator->GenerateNextToken();
     std::string token = generator->Decode();
 
-    // This response contract has no segments/timestamps field yet (tracked separately);
-    // Whisper's <|X.XX|> timestamp tokens must still be excluded from the plain text.
-    if (TryParseWhisperTimestampToken(token)) {
+    // This response contract has no segments/timestamps field yet (tracked separately), but timestamp tokens must
+    // still be excluded from the plain text.
+    if (generator->LastTimestampMilliseconds()) {
       if (original_request.IsCancellationRequested()) {
         generator->Cancel();
       }

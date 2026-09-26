@@ -55,15 +55,18 @@ static std::optional<AudioInternal::WhisperTimestampTokens> ResolveWhisperTimest
   auto eot = ResolveSingleToken(preprocessor, "<|endoftext|>");
   auto no_timestamps = ResolveSingleToken(preprocessor, "<|notimestamps|>");
   auto timestamp_begin = ResolveSingleToken(preprocessor, "<|0.00|>");
-  if (!eot || !no_timestamps || !timestamp_begin) {
+  auto timestamp_end = ResolveSingleToken(preprocessor, "<|30.00|>");
+  if (!eot || !no_timestamps || !timestamp_begin || !timestamp_end) {
     return std::nullopt;
   }
 
-  return AudioInternal::WhisperTimestampTokens{
+  AudioInternal::WhisperTimestampTokens tokens{
       .eot = *eot,
       .no_timestamps = *no_timestamps,
       .timestamp_begin = *timestamp_begin,
+      .timestamp_end = *timestamp_end,
   };
+  return AudioInternal::IsValidWhisperTimestampTokens(tokens) ? std::optional(tokens) : std::nullopt;
 }
 
 // Declared out-of-line so unique_ptr deleters see the complete OGA types.
@@ -108,6 +111,7 @@ bool OnnxAudioGenerator::IsDone() const {
 }
 
 void OnnxAudioGenerator::GenerateNextToken() {
+  last_generated_token_.reset();
   if (cancelled_) {
     return;
   }
@@ -121,7 +125,8 @@ void OnnxAudioGenerator::GenerateNextToken() {
 
     auto next_tokens = generator_->GetNextTokens();
     if (!next_tokens.empty()) {
-      generated_tokens_.push_back(next_tokens[0]);
+      last_generated_token_ = next_tokens[0];
+      generated_tokens_.push_back(*last_generated_token_);
     }
   } catch (const std::runtime_error& e) {
     // If cancelled while generating, the OGA engine throws when the session is terminated.
@@ -138,25 +143,29 @@ void OnnxAudioGenerator::ApplyTimestampRules() {
   // GetLogits returns a CPU copy holding only the last position's logits; SetLogits copies it back to the device.
   auto logits = generator_->GetLogits();
   if (logits->Type() != OgaElementType_float32) {
-    return;
+    FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, "Whisper timestamp decoding requires float32 logits.");
   }
 
   auto shape = logits->Shape();
   if (shape.empty() || shape.back() <= 0) {
-    return;
+    FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, "Whisper timestamp decoding received an invalid logits shape.");
   }
 
-  size_t total = 1;
-  for (auto dim : shape) {
-    total *= static_cast<size_t>(dim);
+  for (size_t i = 0; i + 1 < shape.size(); ++i) {
+    if (shape[i] != 1) {
+      FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL,
+               "Whisper timestamp decoding currently supports only one logits row (batch size 1, one beam).");
+    }
   }
 
-  // Batch size is always 1 for file transcription, so the last vocab-sized row is the only sequence.
   const auto vocab = static_cast<size_t>(shape.back());
+  if (static_cast<size_t>(timestamp_tokens_->timestamp_end) >= vocab) {
+    FL_THROW(FOUNDRY_LOCAL_ERROR_INTERNAL, "Whisper timestamp token IDs exceed the model vocabulary.");
+  }
+
   auto* data = static_cast<float*>(logits->Data());
-  AudioInternal::ApplyWhisperTimestampRules(std::span<float>(data + (total - vocab), vocab), generated_tokens_,
-                                            *timestamp_tokens_, AudioInternal::kWhisperMaxInitialTimestampIndex,
-                                            audio_end_timestamp_index_);
+  AudioInternal::ApplyWhisperTimestampRules(std::span<float>(data, vocab), generated_tokens_, *timestamp_tokens_,
+                                            AudioInternal::kWhisperMaxInitialTimestampIndex, audio_end_timestamp_index_);
   generator_->SetLogits(*logits);
 }
 
@@ -183,6 +192,14 @@ int OnnxAudioGenerator::TokenCount() const {
 
 int OnnxAudioGenerator::PromptTokenCount() const {
   return prompt_token_count_;
+}
+
+std::optional<int64_t> OnnxAudioGenerator::LastTimestampMilliseconds() const {
+  if (!timestamp_tokens_ || !last_generated_token_) {
+    return std::nullopt;
+  }
+
+  return AudioInternal::WhisperTimestampMilliseconds(*last_generated_token_, *timestamp_tokens_);
 }
 
 void OnnxAudioGenerator::Cancel() {
@@ -252,8 +269,8 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
   // 7. Capture prompt token count after inputs are set
   int prompt_token_count = static_cast<int>(generator->GetSequenceCount(0));
 
-  // 8. Create tokenizer stream for decoding. Timestamp tokens (<|X.XX|>) decode to literal text through the regular
-  //    stream, so no special-token stream is needed.
+  // 8. Create the tokenizer stream for ordinary text decoding. Timestamp boundaries are classified by verified token
+  //    IDs rather than locale-sensitive parsing of decoded marker text.
   auto stream = model.GetPreprocessor().CreateTokenizerStream();
 
   // 9. Audio end in timestamp steps, capped at the single 30 s window this generator decodes. Only WAV headers are

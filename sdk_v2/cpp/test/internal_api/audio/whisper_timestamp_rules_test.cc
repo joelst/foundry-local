@@ -5,7 +5,7 @@
 //   0..4   text tokens
 //   5      <|endoftext|>
 //   6..9   control tokens (7 = <|notimestamps|>)
-//   10..19 timestamp tokens <|0.00|>..<|0.18|>
+//   10..1510 timestamp tokens <|0.00|>..<|30.00|>
 //
 
 #include "inferencing/generative/audio/whisper_timestamp_rules.h"
@@ -21,11 +21,17 @@ using namespace fl::AudioInternal;
 
 namespace {
 
-constexpr int kVocab = 20;
+constexpr int kVocab = 1511;
 constexpr int kEot = 5;
 constexpr int kNoTimestamps = 7;
 constexpr int kTsBegin = 10;
-constexpr WhisperTimestampTokens kTokens{.eot = kEot, .no_timestamps = kNoTimestamps, .timestamp_begin = kTsBegin};
+constexpr int kTsEnd = 1510;
+constexpr WhisperTimestampTokens kTokens{
+    .eot = kEot,
+    .no_timestamps = kNoTimestamps,
+    .timestamp_begin = kTsBegin,
+    .timestamp_end = kTsEnd,
+};
 
 std::vector<float> Uniform(float value = 0.0f) {
   return std::vector<float>(kVocab, value);
@@ -35,7 +41,7 @@ std::vector<float> Uniform(float value = 0.0f) {
 std::vector<float> TextPreferred() {
   auto logits = Uniform();
   for (int i = 0; i <= kEot; ++i) {
-    logits[i] = 5.0f;
+    logits[i] = 10.0f;
   }
 
   return logits;
@@ -73,6 +79,14 @@ int Argmax(const std::vector<float>& logits) {
 TEST(WhisperTimestampRulesTest, PromptFallsBackToNoTimestampsWhenRulesAreUnavailable) {
   EXPECT_EQ(BuildWhisperPrompt("en", false), "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>");
   EXPECT_EQ(BuildWhisperPrompt("en", true), "<|startoftranscript|><|en|><|transcribe|>");
+}
+
+TEST(WhisperTimestampRulesTest, TimestampTokenIdsConvertToLocaleIndependentMilliseconds) {
+  EXPECT_FALSE(WhisperTimestampMilliseconds(kTsBegin - 1, kTokens).has_value());
+  EXPECT_EQ(WhisperTimestampMilliseconds(kTsBegin, kTokens), 0);
+  EXPECT_EQ(WhisperTimestampMilliseconds(kTsBegin + 5, kTokens), 100);
+  EXPECT_EQ(WhisperTimestampMilliseconds(kTsEnd, kTokens), 30000);
+  EXPECT_FALSE(WhisperTimestampMilliseconds(kTsEnd + 1, kTokens).has_value());
 }
 
 TEST(WhisperTimestampRulesTest, FirstStepForcesInitialTimestamp) {
@@ -147,6 +161,17 @@ TEST(WhisperTimestampRulesTest, EotAfterPairAllowedNearAudioEnd) {
   EXPECT_FALSE(IsMasked(logits[kEot]));
 }
 
+TEST(WhisperTimestampRulesTest, EotThresholdUsesStrictlyMoreThanOneSecondRemaining) {
+  const std::vector<int32_t> generated{kTsBegin, 1, kTsBegin + 2, kTsBegin + 2};
+  for (int remaining_steps : {49, 50, 51}) {
+    auto logits = Uniform();
+    ApplyWhisperTimestampRules(logits, generated, kTokens, kWhisperMaxInitialTimestampIndex,
+                               2 + remaining_steps);
+    EXPECT_EQ(IsMasked(logits[kEot]), remaining_steps > kWhisperMinRemainingAudioTimestampSteps)
+        << "remaining timestamp steps: " << remaining_steps;
+  }
+}
+
 TEST(WhisperTimestampRulesTest, EotAfterPairAllowedWhenAudioEndUnknown) {
   auto logits = Uniform();
   const std::vector<int32_t> generated{kTsBegin, 1, kTsBegin + 1, kTsBegin + 1};
@@ -219,13 +244,28 @@ TEST(WhisperTimestampRulesTest, DominantTextKeepsTextSelectable) {
   EXPECT_FALSE(IsMasked(logits[kTsBegin + 5]));
 }
 
+TEST(WhisperTimestampRulesTest, VocabularyExtensionsAfterTimestampRangeRemainSelectableText) {
+  auto logits = Uniform(-100.0f);
+  logits.push_back(10.0f);
+  for (int i = kTsBegin; i <= kTsEnd; ++i) {
+    logits[i] = 0.0f;
+  }
+
+  const std::vector<int32_t> generated{kTsBegin, 1};
+  ApplyWhisperTimestampRules(logits, generated, kTokens);
+
+  EXPECT_EQ(Argmax(logits), kVocab);
+  EXPECT_FALSE(IsMasked(logits[kVocab]));
+}
+
 TEST(WhisperTimestampRulesTest, InconsistentTokenIdsLeaveLogitsUnchanged) {
   const std::vector<WhisperTimestampTokens> invalid{
-      {.eot = -1, .no_timestamps = kNoTimestamps, .timestamp_begin = kTsBegin},
-      {.eot = kEot, .no_timestamps = kNoTimestamps, .timestamp_begin = kVocab},
-      {.eot = kEot, .no_timestamps = kTsBegin, .timestamp_begin = kTsBegin},
-      {.eot = kEot, .no_timestamps = kEot, .timestamp_begin = kTsBegin},
-      {.eot = kTsBegin, .no_timestamps = kNoTimestamps, .timestamp_begin = kEot},
+      {.eot = -1, .no_timestamps = kNoTimestamps, .timestamp_begin = kTsBegin, .timestamp_end = kTsEnd},
+      {.eot = kEot, .no_timestamps = kNoTimestamps, .timestamp_begin = kVocab, .timestamp_end = kVocab + 9},
+      {.eot = kEot, .no_timestamps = kTsBegin, .timestamp_begin = kTsBegin, .timestamp_end = kTsEnd},
+      {.eot = kEot, .no_timestamps = kEot, .timestamp_begin = kTsBegin, .timestamp_end = kTsEnd},
+      {.eot = kTsBegin, .no_timestamps = kNoTimestamps, .timestamp_begin = kEot, .timestamp_end = kTsEnd},
+      {.eot = kEot, .no_timestamps = kNoTimestamps, .timestamp_begin = kTsBegin, .timestamp_end = kTsEnd - 1},
   };
 
   for (const auto& tokens : invalid) {
@@ -244,8 +284,8 @@ TEST(WhisperTimestampRulesTest, RealModelTokenLayouts) {
   };
 
   const std::vector<Layout> layouts{
-      {51865, {.eot = 50257, .no_timestamps = 50363, .timestamp_begin = 50364}},
-      {51866, {.eot = 50257, .no_timestamps = 50364, .timestamp_begin = 50365}},
+      {51865, {.eot = 50257, .no_timestamps = 50363, .timestamp_begin = 50364, .timestamp_end = 51864}},
+      {51866, {.eot = 50257, .no_timestamps = 50364, .timestamp_begin = 50365, .timestamp_end = 51865}},
   };
 
   for (const auto& layout : layouts) {

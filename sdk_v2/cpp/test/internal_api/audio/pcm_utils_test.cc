@@ -27,6 +27,14 @@ void AppendU16(std::string& out, uint16_t v) {
   out.append(reinterpret_cast<const char*>(&v), sizeof(v));
 }
 
+void WriteU32(std::string& out, size_t offset, uint32_t v) {
+  std::memcpy(out.data() + offset, &v, sizeof(v));
+}
+
+void WriteU16(std::string& out, size_t offset, uint16_t v) {
+  std::memcpy(out.data() + offset, &v, sizeof(v));
+}
+
 // Minimal RIFF/WAVE file; an optional odd-sized LIST chunk before "data" exercises chunk skipping and padding.
 std::string MakeWav(uint32_t sample_rate, uint16_t channels, uint32_t data_bytes, bool with_list_chunk) {
   std::string body = "WAVE";
@@ -157,4 +165,33 @@ TEST(PcmUtilsTest, WavDurationUnknownForNonWavOrMissingFile) {
 
   TempFile truncated(MakeWav(16000, 1, 32, false).substr(0, 30));
   EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(truncated.path()).has_value());
+}
+
+TEST(PcmUtilsTest, WavDurationRejectsChunksOutsideFileOrRiffBounds) {
+  auto truncated_data = MakeWav(16000, 1, 32, false);
+  truncated_data.resize(truncated_data.size() - 1);
+  TempFile truncated_data_file(truncated_data);
+  EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(truncated_data_file.path()).has_value());
+
+  auto oversized_chunk = MakeWav(16000, 1, 32, false);
+  WriteU32(oversized_chunk, 40, 1024);
+  TempFile oversized_chunk_file(oversized_chunk);
+  EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(oversized_chunk_file.path()).has_value());
+
+  auto short_riff = MakeWav(16000, 1, 32, false);
+  WriteU32(short_riff, 4, 28);
+  TempFile short_riff_file(short_riff);
+  EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(short_riff_file.path()).has_value());
+}
+
+TEST(PcmUtilsTest, WavDurationRejectsInconsistentFormatRates) {
+  auto bad_byte_rate = MakeWav(16000, 1, 32, false);
+  WriteU32(bad_byte_rate, 28, 1234);
+  TempFile bad_byte_rate_file(bad_byte_rate);
+  EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(bad_byte_rate_file.path()).has_value());
+
+  auto bad_block_align = MakeWav(16000, 1, 32, false);
+  WriteU16(bad_block_align, 32, 4);
+  TempFile bad_block_align_file(bad_block_align);
+  EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(bad_block_align_file.path()).has_value());
 }

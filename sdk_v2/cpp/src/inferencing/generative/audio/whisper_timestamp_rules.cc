@@ -42,31 +42,48 @@ float LogSumExp(std::span<const float> values) {
 
 }  // namespace
 
+bool IsValidWhisperTimestampTokens(const WhisperTimestampTokens& tokens) {
+  return tokens.eot >= 0 && tokens.no_timestamps > tokens.eot && tokens.timestamp_begin > tokens.no_timestamps &&
+         tokens.timestamp_end > tokens.timestamp_begin &&
+         tokens.timestamp_end - tokens.timestamp_begin == kWhisperWindowTimestampSteps;
+}
+
+std::optional<int64_t> WhisperTimestampMilliseconds(int32_t token, const WhisperTimestampTokens& tokens) {
+  if (!IsValidWhisperTimestampTokens(tokens) || token < tokens.timestamp_begin || token > tokens.timestamp_end) {
+    return std::nullopt;
+  }
+
+  return static_cast<int64_t>(token - tokens.timestamp_begin) * 20;
+}
+
 void ApplyWhisperTimestampRules(std::span<float> logits,
                                 std::span<const int32_t> generated,
                                 const WhisperTimestampTokens& tokens,
                                 std::optional<int> max_initial_timestamp_index,
                                 std::optional<int> audio_end_timestamp_index) {
   const size_t vocab = logits.size();
-  if (tokens.eot < 0 || tokens.timestamp_begin <= tokens.eot || static_cast<size_t>(tokens.timestamp_begin) >= vocab ||
-      tokens.no_timestamps <= tokens.eot || tokens.no_timestamps >= tokens.timestamp_begin) {
+  if (!IsValidWhisperTimestampTokens(tokens) || static_cast<size_t>(tokens.timestamp_end) >= vocab) {
     return;
   }
 
   const auto eot = static_cast<size_t>(tokens.eot);
   const auto ts_begin = static_cast<size_t>(tokens.timestamp_begin);
+  const auto ts_end = static_cast<size_t>(tokens.timestamp_end);
+  const auto is_timestamp = [&](int32_t token) {
+    return token >= tokens.timestamp_begin && token <= tokens.timestamp_end;
+  };
 
   // Control tokens between <|endoftext|> and <|0.00|> (<|notimestamps|>, <|startoftranscript|>, language/task
   // tokens, ...) are never valid transcription output in timestamp mode.
   Mask(logits, eot + 1, ts_begin);
 
   const size_t n = generated.size();
-  const bool last_was_timestamp = n >= 1 && generated[n - 1] >= tokens.timestamp_begin;
-  const bool penultimate_was_timestamp = n < 2 || generated[n - 2] >= tokens.timestamp_begin;
+  const bool last_was_timestamp = n >= 1 && is_timestamp(generated[n - 1]);
+  const bool penultimate_was_timestamp = n < 2 || is_timestamp(generated[n - 2]);
 
   if (last_was_timestamp) {
     if (penultimate_was_timestamp) {
-      Mask(logits, ts_begin, vocab);  // a closing+opening pair was just emitted: text must follow
+      Mask(logits, ts_begin, ts_end + 1);  // a closing+opening pair was just emitted: text must follow
 
       // Deviation from the reference: there, <|endoftext|> right after an opening timestamp means "continue from this
       // timestamp in the next window" and transcribe() re-decodes the remaining audio. Without that seek loop any
@@ -79,11 +96,11 @@ void ApplyWhisperTimestampRules(std::span<float> logits,
       }
     } else {
       Mask(logits, 0, eot);  // an unpaired timestamp must be followed by another timestamp or EOT
+      Mask(logits, ts_end + 1, vocab);
     }
   }
 
-  auto last_timestamp = std::find_if(generated.rbegin(), generated.rend(),
-                                     [&](int32_t t) { return t >= tokens.timestamp_begin; });
+  auto last_timestamp = std::find_if(generated.rbegin(), generated.rend(), is_timestamp);
   if (last_timestamp != generated.rend()) {
     // Timestamps must not decrease; a segment's closing timestamp must also be strictly after its opening one.
     const auto last = static_cast<size_t>(*last_timestamp);
@@ -93,19 +110,25 @@ void ApplyWhisperTimestampRules(std::span<float> logits,
 
   if (n == 0) {
     Mask(logits, 0, ts_begin);
+    Mask(logits, ts_end + 1, vocab);
     if (max_initial_timestamp_index.has_value() && *max_initial_timestamp_index >= 0) {
-      Mask(logits, ts_begin + static_cast<size_t>(*max_initial_timestamp_index) + 1, vocab);
+      Mask(logits, ts_begin + static_cast<size_t>(*max_initial_timestamp_index) + 1, ts_end + 1);
     }
   }
 
   // log_softmax subtracts the same normalizer from every entry, so comparing raw-logit logsumexp against the max
   // text logit is equivalent to the reference's log-probability comparison.
   const std::span<const float> text_logits(logits.data(), ts_begin);
-  const std::span<const float> timestamp_logits(logits.data() + ts_begin, vocab - ts_begin);
+  const std::span<const float> timestamp_logits(logits.data() + ts_begin, ts_end - ts_begin + 1);
   const float timestamp_logsumexp = LogSumExp(timestamp_logits);
-  const float max_text_logit = *std::max_element(text_logits.begin(), text_logits.end());
+  float max_text_logit = *std::max_element(text_logits.begin(), text_logits.end());
+  if (ts_end + 1 < vocab) {
+    max_text_logit = std::max(max_text_logit, *std::max_element(logits.begin() + ts_end + 1, logits.end()));
+  }
+
   if (timestamp_logsumexp > max_text_logit) {
     Mask(logits, 0, ts_begin);
+    Mask(logits, ts_end + 1, vocab);
   }
 }
 
