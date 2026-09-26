@@ -74,10 +74,9 @@ std::unique_ptr<SpeechSegmentItem> MakeTrailingSegment(std::string text, std::op
   return seg;
 }
 
-// Assemble the final SpeechResultItem from the cumulative text and the per-token segments
-// accumulated during generation. `language` and `duration_ms` are intentionally left unset:
-// the request-side language is just a hint, and GenAI does not report a detected source
-// language or audio duration.
+// Assemble the final SpeechResultItem from the cumulative text and generated segments. Segments may be token-level
+// NONE items or phrase-level timed FINAL items, depending on the decoder. `language` and `duration_ms` are intentionally
+// left unset because the request-side language is only a hint and GenAI does not report either value.
 std::unique_ptr<SpeechResultItem> BuildSpeechResult(
     std::string text, std::vector<std::unique_ptr<SpeechSegmentItem>> segments) {
   auto result = std::make_unique<SpeechResultItem>(std::move(text));
