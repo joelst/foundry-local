@@ -8,6 +8,7 @@
 
 #include "ep_detection/ep_detector.h"
 #include "exception.h"
+#include "inferencing/generative/audio/onnx_audio_generator.h"
 #include "inferencing/generative/audio/pcm_utils.h"
 #include "inferencing/model_load_manager.h"
 #include "items/audio_item.h"
@@ -923,6 +924,27 @@ TEST_F(AudioSessionInferenceTest, TranscribeFromFilePathPopulatesSegmentTimestam
   EXPECT_GT(previous_end_ms, 10000) << "Last segment should end near the end of the ~15.5 s recording";
   EXPECT_LE(previous_end_ms, 16500) << "Last segment should not end past the ~15.5 s recording";
   EXPECT_EQ(response.finish_reason, FOUNDRY_LOCAL_FINISH_STOP);
+}
+
+// GenerateAll() is inherited from AudioGenerator and concatenates raw Decode() results without consulting
+// LastTimestampMilliseconds(), so timestamp suppression has to live in Decode() itself to satisfy its documented
+// contract. The session loops filter boundaries separately and would hide a regression here.
+TEST_F(AudioSessionInferenceTest, GenerateAllDoesNotLeakTimestampMarkers) {
+  if (!model_) {
+    GTEST_SKIP() << "Audio model not loaded";
+  }
+
+  auto audio_path = fl::test::GetTestDataPath("Recording.mp3");
+  ASSERT_TRUE(fs::exists(audio_path)) << "Test audio file not found: " << audio_path;
+
+  auto generator = OnnxAudioGenerator::Create(audio_path.string(), std::nullopt, GetModel(), "en");
+  ASSERT_NE(generator, nullptr);
+
+  const std::string text = generator->GenerateAll();
+
+  EXPECT_EQ(text.find("<|"), std::string::npos) << "GenerateAll leaked a control token: " << text;
+  EXPECT_TRUE(std::any_of(text.begin(), text.end(), [](unsigned char c) { return !std::isspace(c); }))
+      << "GenerateAll should still return transcribed text once timestamps are suppressed";
 }
 
 TEST(AudioTelemetryTest, PcmDurationCountsSamplesIncludingEmptyAndSubMillisecondInput) {

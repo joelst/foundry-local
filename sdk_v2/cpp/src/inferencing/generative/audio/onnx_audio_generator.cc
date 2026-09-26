@@ -182,7 +182,17 @@ std::string OnnxAudioGenerator::Decode() {
   }
 
   int32_t token_id = next_tokens[0];
+
+  // Always advance the tokenizer stream, even for tokens that are not surfaced: it carries partial UTF-8 and
+  // sub-word state across calls, so skipping it here would change the text decoded for later tokens.
   const char* token_text = stream_->Decode(token_id);
+
+  // Timestamp markers are control tokens that bound segments; callers read them via LastTimestampMilliseconds().
+  // Per the AudioGenerator::Decode() contract they must never reach user-visible text, including through the
+  // inherited GenerateAll() helper, which concatenates Decode() results without consulting boundaries.
+  if (timestamp_tokens_ && AudioInternal::WhisperTimestampMilliseconds(token_id, *timestamp_tokens_)) {
+    return "";
+  }
 
   return token_text ? std::string(token_text) : "";
 }

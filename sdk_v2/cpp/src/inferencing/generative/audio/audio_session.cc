@@ -603,8 +603,8 @@ void AudioSession::ProcessAudioTranscriptionJson(const std::string& request_json
     generator->GenerateNextToken();
     std::string token = generator->Decode();
 
-    // This response contract has no segments/timestamps field yet (tracked separately), but timestamp tokens must
-    // still be excluded from the plain text.
+    // Decode() already suppresses timestamp markers, but boundary tokens still carry no text, so skip them
+    // explicitly. This response contract has no segments/timestamps field yet (tracked separately).
     if (generator->LastTimestampMilliseconds()) {
       if (original_request.IsCancellationRequested()) {
         generator->Cancel();
