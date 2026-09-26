@@ -23,7 +23,9 @@ std::vector<float> LoadPcmWavAsFloatSamples(const std::string& audio_file_path);
 int64_t AudioDurationMsFromSamples(int64_t samples);
 
 /// Duration of a RIFF/WAVE file from its fmt byte rate and data chunk size, without decoding samples. Returns nullopt
-/// for unreadable, non-WAV (e.g. MP3/FLAC) or malformed files; never throws.
+/// when the required audio metadata is unreadable, absent, non-WAV (e.g. MP3/FLAC) or internally inconsistent, which
+/// includes a data chunk that does not hold a whole number of sample frames. This is a conservative probe rather than
+/// a full container validator: callers must treat nullopt as "duration unknown". Never throws.
 std::optional<double> TryReadWavDurationSeconds(const std::string& audio_file_path);
 
 }  // namespace AudioInternal

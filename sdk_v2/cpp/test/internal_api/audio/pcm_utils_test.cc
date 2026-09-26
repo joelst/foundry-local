@@ -56,6 +56,9 @@ std::string MakeWav(uint32_t sample_rate, uint16_t channels, uint32_t data_bytes
   body += "data";
   AppendU32(body, data_bytes);
   body.append(data_bytes, '\0');
+  if (data_bytes % 2 != 0) {
+    body += '\0';  // RIFF chunks are word aligned, so an odd-sized data chunk is followed by a pad byte.
+  }
 
   std::string wav = "RIFF";
   AppendU32(wav, static_cast<uint32_t>(body.size()));
@@ -188,4 +191,22 @@ TEST(PcmUtilsTest, WavDurationRejectsInconsistentFormatRates) {
   WriteU16(bad_block_align, 32, 4);
   TempFile bad_block_align_file(bad_block_align);
   EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(bad_block_align_file.path()).has_value());
+}
+
+TEST(PcmUtilsTest, WavDurationRejectsDataChunkWithPartialFrame) {
+  // A data chunk must hold whole sample frames. 16 kHz mono PCM16 has a 2-byte frame, so an odd chunk ends mid-frame
+  // and the header disagrees with the payload. Trusting it would report 1.00003125 s, which rounds the audio end up to
+  // 51 timestamp steps instead of 50 and wrongly engages the end-of-text mask.
+  TempFile mono_partial_frame(MakeWav(16000, 1, 32001, false));
+  EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(mono_partial_frame.path()).has_value());
+
+  // Same gap with a 4-byte stereo frame, where the leftover is larger than a single byte.
+  TempFile stereo_partial_frame(MakeWav(16000, 2, 32002, false));
+  EXPECT_FALSE(AudioInternal::TryReadWavDurationSeconds(stereo_partial_frame.path()).has_value());
+
+  // The exactly frame-aligned neighbour must still report a duration.
+  TempFile aligned(MakeWav(16000, 1, 32000, false));
+  auto duration = AudioInternal::TryReadWavDurationSeconds(aligned.path());
+  ASSERT_TRUE(duration.has_value());
+  EXPECT_DOUBLE_EQ(*duration, 1.0);
 }

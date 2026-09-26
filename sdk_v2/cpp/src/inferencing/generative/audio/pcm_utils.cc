@@ -51,6 +51,7 @@ std::optional<double> AudioInternal::TryReadWavDurationSeconds(const std::string
   const auto riff_end = static_cast<std::streamoff>(riff_end_value);
 
   uint32_t byte_rate = 0;
+  uint16_t block_align = 0;
   while (in) {
     const std::streamoff header_start = in.tellg();
     if (header_start < 0 || riff_end - header_start < 8) {
@@ -79,7 +80,6 @@ std::optional<double> AudioInternal::TryReadWavDurationSeconds(const std::string
       uint16_t audio_format = 0;
       uint16_t channels = 0;
       uint32_t sample_rate = 0;
-      uint16_t block_align = 0;
       uint16_t bits_per_sample = 0;
       in.read(reinterpret_cast<char*>(&audio_format), sizeof(audio_format));
       in.read(reinterpret_cast<char*>(&channels), sizeof(channels));
@@ -95,7 +95,9 @@ std::optional<double> AudioInternal::TryReadWavDurationSeconds(const std::string
 
       in.seekg(chunk_start + static_cast<std::streamoff>(padded_size));
     } else if (std::strncmp(chunk_id, "data", 4) == 0) {
-      if (byte_rate == 0) {
+      // The fmt chunk must have been seen already, and the payload must hold whole sample frames. A partial trailing
+      // frame means the header and the data disagree, so the duration is not trustworthy enough to bound decoding.
+      if (byte_rate == 0 || block_align == 0 || chunk_size % block_align != 0) {
         return std::nullopt;
       }
 
