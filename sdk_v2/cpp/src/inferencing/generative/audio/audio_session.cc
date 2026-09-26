@@ -75,8 +75,8 @@ std::unique_ptr<SpeechSegmentItem> MakeTrailingSegment(std::string text, std::op
 }
 
 // Assemble the final SpeechResultItem from the cumulative text and generated segments. Segments may be token-level
-// NONE items or phrase-level timed FINAL items, depending on the decoder. `language` and `duration_ms` are intentionally
-// left unset because the request-side language is only a hint and GenAI does not report either value.
+// NONE items or phrase-level timed FINAL items, depending on the decoder. `language` and `duration_ms` are
+// intentionally left unset because the request-side language is only a hint and GenAI does not report either value.
 std::unique_ptr<SpeechResultItem> BuildSpeechResult(
     std::string text, std::vector<std::unique_ptr<SpeechSegmentItem>> segments) {
   auto result = std::make_unique<SpeechResultItem>(std::move(text));
@@ -310,7 +310,8 @@ void AudioSession::ProcessRequestImpl(const Request& request, Response& response
       if (current_segment_start_ms.has_value()) {
         if (HasNonWhitespace(current_segment_text)) {
           token_texts.push_back(current_segment_text);
-          segments.push_back(MakeTimedSegment(std::move(current_segment_text), *current_segment_start_ms, *boundary_ms));
+          segments.push_back(
+              MakeTimedSegment(std::move(current_segment_text), *current_segment_start_ms, *boundary_ms));
         }
 
         current_segment_text.clear();
@@ -558,7 +559,8 @@ void AudioSession::ProcessAudioTranscriptionJson(const std::string& request_json
   // Validate file exists
   namespace fs = std::filesystem;
   if (!fs::exists(req.filename)) {
-    FL_LOG_AND_THROW(logger_, FOUNDRY_LOCAL_ERROR_INVALID_USAGE, fmt::format("Audio file not found: '{}'", req.filename));
+    FL_LOG_AND_THROW(logger_, FOUNDRY_LOCAL_ERROR_INVALID_USAGE,
+                     fmt::format("Audio file not found: '{}'", req.filename));
   }
 
   // Nemotron speech models are RNNT-based and do not use the Whisper-oriented OnnxAudioGenerator path below.
@@ -680,10 +682,10 @@ void AudioSession::TryNemotronLanguageId(OgaGenerator& generator, const std::str
   }
 }
 
-void AudioSession::DecodeNemotronTokens(OgaGenerator& generator, OgaTokenizerStream& tokenizer_stream, std::string& text,
-                                        const std::unique_ptr<CallbackHandler>& streaming_callback,
-                                        const std::string& response_id, const Request& original_request,
-                                        int& completion_tokens) const {
+void AudioSession::DecodeNemotronTokens(
+    OgaGenerator& generator, OgaTokenizerStream& tokenizer_stream, std::string& text,
+    const std::unique_ptr<CallbackHandler>& streaming_callback, const std::string& response_id,
+    const Request& original_request, int& completion_tokens) const {
   const bool is_streaming = (streaming_callback != nullptr);
 
   while (!generator.IsDone() && !generator.IsSessionTerminated() &&

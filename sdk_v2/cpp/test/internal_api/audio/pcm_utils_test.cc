@@ -5,12 +5,12 @@
 //
 
 #include "inferencing/generative/audio/pcm_utils.h"
+#include "utils/temp_path.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -65,20 +65,14 @@ std::string MakeWav(uint32_t sample_rate, uint16_t channels, uint32_t data_bytes
 class TempFile {
  public:
   explicit TempFile(const std::string& contents)
-      : path_(std::filesystem::temp_directory_path() /
-              ("pcm_utils_test_" + std::to_string(reinterpret_cast<uintptr_t>(this)) + ".wav")) {
-    std::ofstream(path_, std::ios::binary) << contents;
-  }
-
-  ~TempFile() {
-    std::error_code ec;
-    std::filesystem::remove(path_, ec);
+      : path_(fl::test::TempPath::CreateTempFile("pcm_utils_test_")) {
+    std::ofstream(path_.path(), std::ios::binary) << contents;
   }
 
   std::string path() const { return path_.string(); }
 
  private:
-  std::filesystem::path path_;
+  fl::test::TempPath path_;
 };
 
 }  // namespace

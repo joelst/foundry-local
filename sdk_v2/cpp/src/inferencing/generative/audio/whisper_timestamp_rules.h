@@ -36,6 +36,10 @@ bool IsValidWhisperTimestampTokens(const WhisperTimestampTokens& tokens);
 /// token layout.
 std::optional<int64_t> WhisperTimestampMilliseconds(int32_t token, const WhisperTimestampTokens& tokens);
 
+/// Convert an audio duration to its inclusive Whisper timestamp-step boundary, rounding partial steps up and capping
+/// the result at one decoding window.
+int WhisperTimestampIndexForDuration(double duration_seconds);
+
 /// Apply OpenAI Whisper's timestamp decoding rules (ApplyTimestampRules in openai/whisper decoding.py) to one row of
 /// next-token logits, in place. Without these rules, greedy decoding picks `<|notimestamps|>` as the first token even
 /// when the prompt omits it, so no timestamp tokens are ever generated.

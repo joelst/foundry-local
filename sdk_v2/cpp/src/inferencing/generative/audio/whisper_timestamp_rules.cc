@@ -56,6 +56,22 @@ std::optional<int64_t> WhisperTimestampMilliseconds(int32_t token, const Whisper
   return static_cast<int64_t>(token - tokens.timestamp_begin) * 20;
 }
 
+int WhisperTimestampIndexForDuration(double duration_seconds) {
+  if (!(duration_seconds > 0.0)) {
+    return 0;
+  }
+
+  double steps = duration_seconds / kWhisperTimestampStepSeconds;
+  const double nearest_integer = std::round(steps);
+  const double tolerance = 8 * std::numeric_limits<double>::epsilon() * std::max(1.0, std::abs(steps));
+  if (std::abs(steps - nearest_integer) <= tolerance) {
+    steps = nearest_integer;
+  }
+
+  steps = std::ceil(steps);
+  return static_cast<int>(std::min(steps, static_cast<double>(kWhisperWindowTimestampSteps)));
+}
+
 void ApplyWhisperTimestampRules(std::span<float> logits,
                                 std::span<const int32_t> generated,
                                 const WhisperTimestampTokens& tokens,

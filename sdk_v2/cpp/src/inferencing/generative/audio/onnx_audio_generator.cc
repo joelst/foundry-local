@@ -164,8 +164,9 @@ void OnnxAudioGenerator::ApplyTimestampRules() {
   }
 
   auto* data = static_cast<float*>(logits->Data());
-  AudioInternal::ApplyWhisperTimestampRules(std::span<float>(data, vocab), generated_tokens_, *timestamp_tokens_,
-                                            AudioInternal::kWhisperMaxInitialTimestampIndex, audio_end_timestamp_index_);
+  AudioInternal::ApplyWhisperTimestampRules(
+      std::span<float>(data, vocab), generated_tokens_, *timestamp_tokens_,
+      AudioInternal::kWhisperMaxInitialTimestampIndex, audio_end_timestamp_index_);
   generator_->SetLogits(*logits);
 }
 
@@ -234,8 +235,8 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
   std::vector<const char*> paths = {audio_file_path.c_str()};
   auto audios = OgaAudios::Load(paths);
 
-  // 2. Resolve model-specific timestamp token IDs before building the prompt. If resolution fails, retain the previous
-  //    <|notimestamps|> behavior rather than allowing the model to emit an unmasked control token into user-visible text.
+  // 2. Resolve model-specific timestamp token IDs before building the prompt. If resolution fails, retain the
+  //    previous <|notimestamps|> behavior rather than allowing an unmasked control token into user-visible text.
   auto timestamp_tokens = ResolveWhisperTimestampTokens(model.GetPreprocessor());
 
   // 3. Build the Whisper prompt with optional language tag.
@@ -277,8 +278,7 @@ std::unique_ptr<OnnxAudioGenerator> OnnxAudioGenerator::Create(const std::string
   //    probed; for other formats the end is unknown and the timestamp rules fall back to the reference EOT behavior.
   std::optional<int> audio_end_timestamp_index;
   if (auto duration = AudioInternal::TryReadWavDurationSeconds(audio_file_path)) {
-    const double steps = std::floor(*duration / AudioInternal::kWhisperTimestampStepSeconds);
-    audio_end_timestamp_index = static_cast<int>(std::min(steps, double{AudioInternal::kWhisperWindowTimestampSteps}));
+    audio_end_timestamp_index = AudioInternal::WhisperTimestampIndexForDuration(*duration);
   }
 
   // `std::make_unique` cannot access the private constructor, so use `new` directly.

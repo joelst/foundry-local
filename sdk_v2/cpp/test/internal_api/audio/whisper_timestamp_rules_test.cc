@@ -89,6 +89,34 @@ TEST(WhisperTimestampRulesTest, TimestampTokenIdsConvertToLocaleIndependentMilli
   EXPECT_FALSE(WhisperTimestampMilliseconds(kTsEnd + 1, kTokens).has_value());
 }
 
+TEST(WhisperTimestampRulesTest, AudioDurationRoundsPartialTimestampStepsUp) {
+  constexpr double kSampleRate = 16000.0;
+
+  EXPECT_EQ(WhisperTimestampIndexForDuration(0.0), 0);
+  EXPECT_EQ(WhisperTimestampIndexForDuration(1.0), 50);
+  EXPECT_EQ(WhisperTimestampIndexForDuration(1.01), 51);
+  EXPECT_EQ(WhisperTimestampIndexForDuration(17919 / kSampleRate), 56);
+  EXPECT_EQ(WhisperTimestampIndexForDuration(17920 / kSampleRate), 56);
+  EXPECT_EQ(WhisperTimestampIndexForDuration(17921 / kSampleRate), 57);
+  EXPECT_EQ(WhisperTimestampIndexForDuration(30.0), 1500);
+  EXPECT_EQ(WhisperTimestampIndexForDuration(31.0), 1500);
+}
+
+TEST(WhisperTimestampRulesTest, FractionalAudioDurationPreservesStrictEotThreshold) {
+  constexpr double kSampleRate = 16000.0;
+  const std::vector<int32_t> generated{kTsBegin, 1, kTsBegin + 6, kTsBegin + 6};
+  const auto eot_is_masked = [&](double duration_seconds) {
+    auto logits = Uniform();
+    ApplyWhisperTimestampRules(logits, generated, kTokens, kWhisperMaxInitialTimestampIndex,
+                               WhisperTimestampIndexForDuration(duration_seconds));
+    return IsMasked(logits[kEot]);
+  };
+
+  EXPECT_FALSE(eot_is_masked(17919 / kSampleRate));
+  EXPECT_FALSE(eot_is_masked(17920 / kSampleRate));
+  EXPECT_TRUE(eot_is_masked(17921 / kSampleRate));
+}
+
 TEST(WhisperTimestampRulesTest, FirstStepForcesInitialTimestamp) {
   // Mirrors the real failure: <|notimestamps|> is the greedy choice without the rules.
   auto logits = Uniform();
